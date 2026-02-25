@@ -1,0 +1,5 @@
+streamlit
+sqlalchemy
+passlib
+matplotlib
+psycopg2-binary
