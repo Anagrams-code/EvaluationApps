@@ -1,5 +1,6 @@
 streamlit
 sqlalchemy
-passlib
+passlib[bcrypt]
+bcrypt
 matplotlib
 psycopg2-binary
