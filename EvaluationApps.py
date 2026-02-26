@@ -57,7 +57,7 @@ relationship,
 # ----------------------------
 # Constants
 # ----------------------------
-APP_TITLE = "目標管理・評価・1on1（All-in-one)"
+APP_TITLE = "目標管理アプリ"
 # Use a PBKDF2 fallback so app works even when bcrypt backend isn't available
 # Keep bcrypt in the list so existing bcrypt hashes are still recognized.
 PWD_CONTEXT = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], default="pbkdf2_sha256", deprecated="auto")
@@ -371,12 +371,12 @@ def init_db() -> None:
 
 def seed_admin_if_needed() -> None:
     with SessionLocal() as db:
-        existing = db.execute(select(Employee).where(Employee.emp_no == "0001")).scalar_one_or_none()
+        existing = db.execute(select(Employee).where(Employee.emp_no == "000001")).scalar_one_or_none()
         if existing:
             return
         admin = Employee(
-            emp_no="0001",
-            name="HR 管理者（初期）",
+            emp_no="000001",
+            name="HR 管理者",
             department="HR",
             password_hash=PWD_CONTEXT.hash(admin_seed_password()),
             active=True,
@@ -711,7 +711,7 @@ def page_login() -> None:
 
     with st.form("login_form", clear_on_submit=False):
         role: Role = st.selectbox("ロールを選択", ["管理者", "評価者", "入力者"])
-        emp_no = st.text_input("従業員番号", placeholder="例: 0001")
+        emp_no = st.text_input("従業員番号", placeholder="例: 000001")
         password = st.text_input("パスワード", type="password")
         submitted = st.form_submit_button("ログイン")
 
@@ -721,7 +721,6 @@ def page_login() -> None:
             set_page("forgot_password")
 
     if not submitted:
-        st.info("初期管理者: 従業員番号 0001 / 初期PWは Secrets の ADMIN_SEED_PASSWORD")
         return
 
     emp_no = emp_no.strip()
@@ -866,8 +865,8 @@ def _parse_bool(v: Any, default: bool = False) -> bool:
 def _csv_template_text() -> str:
     return (
         "emp_no,name,department,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
-        "0002,山田太郎,Sales,1,0,1,1,0100,TempPass_1234\n"
-        "0100,佐藤花子,Sales,1,0,1,0,,TempPass_5678\n"
+        "000002,山田太郎,Sales,1,0,1,1,010000,TempPass_1234\n"
+        "010000,佐藤花子,Sales,1,0,1,0,,TempPass_5678\n"
     )
 
 
@@ -963,10 +962,10 @@ def page_admin_employee_master() -> None:
     st.markdown("### 画面で追加/更新（手動）")
 
     with st.form("emp_upsert", clear_on_submit=True):
-        emp_no = st.text_input("従業員番号", placeholder="例: 0002")
+        emp_no = st.text_input("従業員番号", placeholder="例: 000002")
         name = st.text_input("氏名", placeholder="例: 山田 太郎")
         department = st.text_input("部署", placeholder="例: Sales")
-        password = st.text_input("初期/変更パスワード（空なら変更しない）", type="password")
+        password = st.text_input("変更パスワード（空なら変更しない）", type="password")
         active = st.checkbox("在籍", value=True)
 
         col1, col2, col3 = st.columns(3)
@@ -977,7 +976,7 @@ def page_admin_employee_master() -> None:
         with col3:
             role_employee = st.checkbox("入力者権限", value=True)
 
-        manager_emp_no = st.text_input("上長の従業員番号（任意）", placeholder="例: 0100（評価者）")
+        manager_emp_no = st.text_input("上長の従業員番号（任意）", placeholder="例: 010000（評価者）")
         ok = st.form_submit_button("保存")
 
     if ok:
@@ -1006,7 +1005,7 @@ def page_admin_employee_master() -> None:
                     st.success("更新しました。")
                 else:
                     if not password:
-                        st.error("新規追加の場合、初期パスワードは必須です。")
+                        st.error("新規追加の場合、パスワードは必須です。")
                     else:
                         emp = Employee(
                             emp_no=emp_no,
