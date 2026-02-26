@@ -4,23 +4,19 @@ All-in-one Streamlit App: Goal -> Approval -> Evaluation -> 1on1 -> CSV
 Streamlit Community Cloud + PostgreSQL
 
 Integrated fixes:
-- 年度をデータに持たせ、年度運用できるように（既存のyear列は維持）
-- ログイン画面で年度入力（4桁の数値）→ 以後セッション固定（全ページ共通）
+- 年度をログイン時に入力（4桁の数値）→ セッション固定（全ページ共通）
+- DBは既存のyear列を使用（年度運用）
 - year未定義エラー修正（eval_input_self等）
 - SQLite既存DBのスキーマ差分を軽量マイグレーションで吸収
-  - employees.email / employees.manager_email が無いDBでも落ちない
+  - employees.email が無いDBでも落ちない
 - 初期管理者（000001, 425025）の初期PWは ChangeMe_1234（Secrets未設定でも）
-- 目標入力UIを改善（business/dev をフォーム＋最大件数、期限は日付入力）
-- 閲覧画面を新ラベル表示に変更（期限はYYYY-MM-DDなら日本語表示）
-- 従業員マスタCSVの文字コードにフォールバック（UTF-8/Shift_JIS等）
-
-Run:
-pip install -r requirements.txt
-streamlit run app.py
-
-Secrets (Streamlit Community Cloud):
-DATABASE_URL="postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME"
-ADMIN_SEED_PASSWORD="ChangeMe_1234"
+- CSVアップロードの文字コード問題（UTF-8/CP932）を吸収
+- 従業員マスタに email 列を追加（CSV/手動）
+- 目標入力UI刷新（business最大5 / development最大2）
+  - business: 対象業務 / 達成したい結果 / 期限(日付) / 部署ゴールとの関連性 / 実行計画(任意)
+  - development: なりたい人物像/身につけたいスキル / 現在の自分とのギャップ / 行動 / 実行計画(任意) / 完了時期(任意: 日付)
+- SMART理論の説明をサイドバーに表示
+- Streamlit rerun による SQLAlchemy セッション不整合対策（merge）
 """
 
 from __future__ import annotations
@@ -50,6 +46,7 @@ from sqlalchemy import (
     UniqueConstraint,
     ForeignKey,
     event,
+    inspect,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -76,7 +73,11 @@ BRAND_COLORS = {
     "info": "#17a2b8",
 }
 
-PWD_CONTEXT = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], default="pbkdf2_sha256", deprecated="auto")
+PWD_CONTEXT = CryptContext(
+    schemes=["pbkdf2_sha256", "bcrypt"],
+    default="pbkdf2_sha256",
+    deprecated="auto",
+)
 
 Role = Literal["HR管理者", "評価者", "入力者"]
 ROLE_TO_FLAG = {"HR管理者": "role_admin", "評価者": "role_manager", "入力者": "role_employee"}
@@ -100,10 +101,8 @@ EVAL_STATUSES = {
     "hr_approved": "公開（確定）",
 }
 
-# what判定（加重平均%）
 WHAT_THRESHOLDS = {"exceeds": 130.0, "meets": 95.0}
 
-# how判定（得点率、満点160=40問×4点）
 HOW_TOTAL_MAX = 160
 HOW_EXCEEDS_RATIO = 0.9
 HOW_MEETS_RATIO = 0.6
@@ -118,6 +117,9 @@ HOW_CATEGORIES: List[Tuple[str, str]] = [
     ("change_leadership", "チェンジリーダーシップ"),
     ("efficiency", "効率化"),
 ]
+
+BUSINESS_GOAL_MAX = 5
+DEVELOPMENT_GOAL_MAX = 2
 
 
 # ----------------------------
@@ -141,6 +143,9 @@ def database_url() -> str:
 
 def admin_seed_password() -> str:
     return get_secret("ADMIN_SEED_PASSWORD", "ChangeMe_1234") or "ChangeMe_1234"
+
+
+DEFAULT_PASSWORD_IF_BLANK = "ChangeMe_1234"
 
 
 # ----------------------------
@@ -177,34 +182,10 @@ def year_input_login(default_year: int) -> int:
     )
 
 
-def year_badge() -> None:
-    st.markdown(f"**年度：{get_selected_year()}**")
-
-
-def format_jp_date(s: str) -> str:
-    """
-    'YYYY-MM-DD' なら 'YYYY年M月D日' に整形して返す。
-    それ以外（空、Q4末など）はそのまま返す。
-    """
-    raw = (s or "").strip()
-    if not raw:
-        return ""
-    try:
-        d = datetime.strptime(raw[:10], "%Y-%m-%d").date()
-        return f"{d.year}年{d.month}月{d.day}日"
-    except Exception:
-        return raw
-
-
 # ----------------------------
 # Email Support
 # ----------------------------
 def send_email(to_email: Optional[str], subject: str, body: str) -> bool:
-    """
-    Send email notification
-    Configuration via environment variables:
-      SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM_EMAIL
-    """
     if not to_email or not to_email.strip():
         return False
 
@@ -304,16 +285,19 @@ class GoalItem(Base):
 
     type: Mapped[str] = mapped_column(String(16), nullable=False)  # business/development
 
-    specific: Mapped[str] = mapped_column(Text, nullable=False)
-    measurable: Mapped[str] = mapped_column(Text, nullable=False)
-    achievable: Mapped[str] = mapped_column(Text, nullable=False)
-    relevant: Mapped[str] = mapped_column(Text, nullable=False)
-    time_bound: Mapped[str] = mapped_column(Text, nullable=False)
+    # 共通（画面ではラベルを差し替える）
+    specific: Mapped[str] = mapped_column(Text, nullable=False)      # 対象業務 / なりたい人物像
+    measurable: Mapped[str] = mapped_column(Text, nullable=False)    # 達成したい結果 / ギャップ
+    relevant: Mapped[str] = mapped_column(Text, nullable=False)      # 部署ゴールとの関連性 / 行動
+    achievable: Mapped[str] = mapped_column(Text, nullable=False)    # 実行計画(任意)
+    time_bound: Mapped[str] = mapped_column(Text, nullable=False)    # 期限(日付ISO) / 完了時期(日付ISO, 任意)
 
+    # developmentだけ追加情報が必要なら使用（今回は未使用のまま保持）
     career_vision: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    weight: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # business only 0..100
-    achieved_percent: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # business only 0..200
+    # businessのみ
+    weight: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)           # 0..100
+    achieved_percent: Mapped[Optional[int]] = mapped_column(Integer, nullable=True) # 0..200
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -328,7 +312,7 @@ class GoalApproval(Base):
     goal_id: Mapped[int] = mapped_column(Integer, ForeignKey("goals.id"), nullable=False)
 
     stage: Mapped[str] = mapped_column(String(16), nullable=False)  # employee/manager/hr
-    action: Mapped[str] = mapped_column(String(16), nullable=False)  # save/submit/approve/return
+    action: Mapped[str] = mapped_column(String(16), nullable=False) # save/submit/approve/return
     comment: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
     actor_emp_no: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -401,7 +385,7 @@ class EvaluationApproval(Base):
     evaluation_id: Mapped[int] = mapped_column(Integer, ForeignKey("evaluations.id"), nullable=False)
 
     stage: Mapped[str] = mapped_column(String(16), nullable=False)  # self/manager/hr
-    action: Mapped[str] = mapped_column(String(16), nullable=False)  # save/submit/approve/return
+    action: Mapped[str] = mapped_column(String(16), nullable=False) # save/submit/approve/return
     comment: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
     actor_emp_no: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -455,7 +439,7 @@ def _get_engine():
         )
 
         @event.listens_for(engine, "connect")
-        def set_sqlite_pragma(dbapi_conn, connection_record):
+        def set_sqlite_pragma(dbapi_conn, _):
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.close()
@@ -478,10 +462,6 @@ def _sqlite_table_exists(conn, table: str) -> bool:
 
 
 def migrate_sqlite_schema_if_needed() -> None:
-    """
-    SQLite only:
-    create_all() doesn't ALTER existing tables, so add missing columns to avoid OperationalError.
-    """
     if not database_url().startswith("sqlite://"):
         return
 
@@ -499,18 +479,12 @@ def migrate_sqlite_schema_if_needed() -> None:
 
 def init_db() -> None:
     Base.metadata.create_all(ENGINE)
-    migrate_sqlite_schema_if_needed()  # seedより前
+    migrate_sqlite_schema_if_needed()
     seed_admin_if_needed()
     seed_how_questions_if_needed()
 
 
 def seed_admin_if_needed() -> None:
-    """
-    Seed:
-      - 000001 HR 管理者
-      - 425025 土田光範
-    初期PW: ChangeMe_1234
-    """
     with SessionLocal() as db:
         existing = db.execute(select(Employee).where(Employee.emp_no == "000001")).scalar_one_or_none()
         if existing:
@@ -659,6 +633,16 @@ def seed_how_questions_if_needed() -> None:
 
 
 # ----------------------------
+# ORM attach helper (Streamlit rerun safe)
+# ----------------------------
+def attach(db, obj):
+    stt = inspect(obj)
+    if stt.session is db:
+        return obj
+    return db.merge(obj)
+
+
+# ----------------------------
 # Auth / Session
 # ----------------------------
 @dataclass(frozen=True)
@@ -742,6 +726,19 @@ def can_edit_goal(status: str) -> bool:
 
 def can_edit_eval_self(status: str) -> bool:
     return status in {"draft", "manager_returned", "hr_returned"}
+
+
+def parse_iso_date(s: str) -> Optional[date]:
+    try:
+        if not s:
+            return None
+        return date.fromisoformat(str(s).strip())
+    except Exception:
+        return None
+
+
+def to_iso_date(d: Optional[date]) -> str:
+    return d.isoformat() if d else ""
 
 
 def calc_what_from_business(items: List[GoalItem]) -> Tuple[float, str]:
@@ -845,89 +842,80 @@ def get_or_create_evaluation(db, employee_emp_no: str, year: int, goal_id: int) 
 # ----------------------------
 # UI Helpers
 # ----------------------------
+SMART_TEXT = """
+### SMART理論（目標設定のフレームワーク）
+- **S: Specific（具体的）**  
+  何を・どこで・誰が・どれくらい、が説明できる状態にする
+- **M: Measurable（測定可能）**  
+  成果を数字・指標・判定条件で確認できるようにする
+- **A: Achievable（達成可能）**  
+  実行計画（任意）として「どうやるか」を書くとブレが減る
+- **R: Relevant（関連性）**  
+  部署ゴールや組織の方向性とつながっていることを示す
+- **T: Time-bound（期限）**  
+  いつまでに達成するか（日付）を明確にする
+"""
+
+
 def apply_custom_styles() -> None:
     st.markdown(
         f"""
-    <style>
-    :root {{
-        --primary-color: {BRAND_COLORS['primary']};
-        --secondary-color: {BRAND_COLORS['secondary']};
-    }}
-
-    .main-header {{
-        background: linear-gradient(135deg, {BRAND_COLORS['primary']} 0%, {BRAND_COLORS['secondary']} 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: {BRAND_COLORS['secondary']};
-        margin-bottom: 20px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }}
-
-    .main-header h1 {{
-        color: {BRAND_COLORS['secondary']};
-        margin: 0;
-        font-size: 28px;
-        font-weight: 700;
-    }}
-
-    .user-info {{
-        color: {BRAND_COLORS['dark_gray']};
-        font-size: 14px;
-        text-align: right;
-    }}
-
-    [data-testid="stSidebar"] {{
-        background-color: {BRAND_COLORS['light_gray']};
-    }}
-
-    .stTextInput > div > div > input,
-    .stSelectbox > div > div > select,
-    .stNumberInput > div > div > input {{
-        border: 2px solid {BRAND_COLORS['border_gray']};
-        border-radius: 5px;
-    }}
-
-    h2, h3 {{
-        color: {BRAND_COLORS['secondary']};
-        border-bottom: 3px solid {BRAND_COLORS['primary']};
-        padding-bottom: 10px;
-    }}
-
-    .stButton > button {{
-        background-color: {BRAND_COLORS['primary']};
-        color: {BRAND_COLORS['secondary']};
-        border: none;
-        border-radius: 5px;
-        font-weight: 600;
-        padding: 10px 20px;
-        transition: all 0.3s ease;
-    }}
-
-    .stButton > button:hover {{
-        background-color: {BRAND_COLORS['secondary']};
-        color: {BRAND_COLORS['primary']};
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    }}
-    </style>
-    """,
+<style>
+:root {{
+  --primary-color: {BRAND_COLORS['primary']};
+  --secondary-color: {BRAND_COLORS['secondary']};
+}}
+.main-header {{
+  background: linear-gradient(135deg, {BRAND_COLORS['primary']} 0%, {BRAND_COLORS['secondary']} 100%);
+  padding: 20px;
+  border-radius: 10px;
+  color: {BRAND_COLORS['secondary']};
+  margin-bottom: 20px;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}}
+.main-header h1 {{
+  color: {BRAND_COLORS['secondary']};
+  margin: 0;
+  font-size: 28px;
+  font-weight: 700;
+}}
+.user-info {{
+  color: {BRAND_COLORS['dark_gray']};
+  font-size: 14px;
+  text-align: right;
+}}
+[data-testid="stSidebar"] {{
+  background-color: {BRAND_COLORS['light_gray']};
+}}
+.stTextInput > div > div > input,
+.stSelectbox > div > div > select,
+.stNumberInput > div > div > input {{
+  border: 2px solid {BRAND_COLORS['border_gray']};
+  border-radius: 5px;
+}}
+h2, h3 {{
+  color: {BRAND_COLORS['secondary']};
+  border-bottom: 3px solid {BRAND_COLORS['primary']};
+  padding-bottom: 10px;
+}}
+.stButton > button {{
+  background-color: {BRAND_COLORS['primary']};
+  color: {BRAND_COLORS['secondary']};
+  border: none;
+  border-radius: 5px;
+  font-weight: 600;
+  padding: 10px 20px;
+  transition: all 0.3s ease;
+}}
+.stButton > button:hover {{
+  background-color: {BRAND_COLORS['secondary']};
+  color: {BRAND_COLORS['primary']};
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}}
+</style>
+""",
         unsafe_allow_html=True,
     )
-
-
-def section_title(title: str, icon: str = "📌") -> None:
-    st.markdown(
-        f"""
-    <div style="display: flex; align-items: center; margin: 20px 0 15px 0;">
-        <h2 style="color: {BRAND_COLORS['secondary']}; margin: 0; font-size: 24px; font-weight: 700;">
-            {icon} {title}
-        </h2>
-    </div>
-    <div style="height: 3px; background: linear-gradient(90deg, {BRAND_COLORS['primary']} 0%, transparent 100%); margin-bottom: 15px;"></div>
-    """,
-        unsafe_allow_html=True,
-    )
-    if get_auth():
-        year_badge()
 
 
 def header_bar(user: Optional[AuthUser]) -> None:
@@ -959,36 +947,15 @@ def header_bar(user: Optional[AuthUser]) -> None:
 def nav_sidebar(user: Optional[AuthUser]) -> None:
     with st.sidebar:
         st.markdown(
-            f'<div style="background-color: {BRAND_COLORS["primary"]}; padding: 15px; border-radius: 5px; margin-bottom: 20px;">'
+            f'<div style="background-color: {BRAND_COLORS["primary"]}; padding: 15px; border-radius: 5px; margin-bottom: 10px;">'
             f'<h2 style="color: #000; margin: 0; font-size: 18px;">📊 Navigation</h2>'
             f"</div>",
             unsafe_allow_html=True,
         )
 
-        # SMART help
-        with st.expander("🧠 SMARTとは（入力のコツ）", expanded=False):
-            st.markdown(
-                """
-**SMART**は、目標を「曖昧な気合」ではなく「行動と結果」に落とすフレームです。
+        st.markdown(SMART_TEXT)
 
-- **S（Specific）具体性**：何を対象にするか（業務・テーマ）
-- **M（Measurable）結果**：何がどうなれば達成か（成果・アウトプット・数値）
-- **A（Achievable）実行計画（任意）**：どう進めるか（方法・手順・工夫）
-- **R（Relevant）関連性**：部署ゴールや組織の優先事項とどうつながるか
-- **T（Time-bound）期限**：いつまでに（期日、マイルストーン）
-
-**良い例**
-- 対象が明確（何の業務か）
-- 結果が判断できる（成果物 / 指標）
-- 期限が具体（YYYY-MM-DD など）
-- 部署ゴールとの関係が説明できる
-
-**悪い例**
-- 「がんばる」「成長する」だけで、結果が判定できない
-- 期限が「なるはや」など曖昧
-- 部署ゴールとのつながりが書かれていない
-                """
-            )
+        st.markdown("---")
 
         if not user:
             st.warning("⚠️ Please log in to access the system.")
@@ -1042,14 +1009,15 @@ def nav_sidebar(user: Optional[AuthUser]) -> None:
 def page_login() -> None:
     st.markdown(
         f"""
-    <div style="display: flex; justify-content: center; align-items: center; min-height: 60vh;">
-        <div style="background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 420px; width: 100%;">
-            <div style="text-align: center; margin-bottom: 30px;">
-                <h1 style="color: {BRAND_COLORS['secondary']}; margin: 0 0 10px 0;">🏭</h1>
-                <h2 style="color: {BRAND_COLORS['secondary']}; margin: 0 0 5px 0; font-size: 24px;">Stanley Black & Decker</h2>
-                <p style="color: {BRAND_COLORS['dark_gray']}; margin: 0; font-size: 14px;">Goal Management System</p>
-            </div>
-    """,
+<div style="display: flex; justify-content: center; align-items: center; min-height: 60vh;">
+  <div style="background: white; padding: 40px; border-radius: 10px;
+              box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 420px; width: 100%;">
+    <div style="text-align: center; margin-bottom: 30px;">
+      <h1 style="color: {BRAND_COLORS['secondary']}; margin: 0 0 10px 0;">🏭</h1>
+      <h2 style="color: {BRAND_COLORS['secondary']}; margin: 0 0 5px 0; font-size: 24px;">Stanley Black & Decker</h2>
+      <p style="color: {BRAND_COLORS['dark_gray']}; margin: 0; font-size: 14px;">Goal Management System</p>
+    </div>
+""",
         unsafe_allow_html=True,
     )
 
@@ -1093,7 +1061,8 @@ def page_login() -> None:
 
         set_selected_year(int(login_year), force=True)
 
-        set_auth(AuthUser(emp_no=emp.emp_no, name=emp.name, role=role, role_key=ROLE_TO_KEY[role]))
+        auth = AuthUser(emp_no=emp.emp_no, name=emp.name, role=role, role_key=ROLE_TO_KEY[role])
+        set_auth(auth)
 
         if emp.must_change_password:
             set_page("password_change")
@@ -1105,7 +1074,7 @@ def page_login() -> None:
 
 
 def page_forgot_password() -> None:
-    section_title("Password Recovery", "🔐")
+    st.subheader("Password Recovery")
     st.info("👨‍💼 Contact your administrator to reset your password.")
     if st.button("🔙 Back to Login"):
         set_page("login")
@@ -1118,7 +1087,7 @@ def page_password_change() -> None:
         set_page("login")
         st.stop()
 
-    section_title("Change Password", "🔐")
+    st.subheader("Change Password")
 
     with st.form("pw_change", clear_on_submit=True):
         current = st.text_input("現在のパスワード", type="password")
@@ -1166,18 +1135,19 @@ def page_password_change() -> None:
 # ----------------------------
 def page_home() -> None:
     user = require_login()
+    year = get_selected_year()
 
     st.markdown(
         f"""
-    <div style="background: linear-gradient(135deg, {BRAND_COLORS['primary']}, {BRAND_COLORS['secondary']}); padding: 30px; border-radius: 10px; margin-bottom: 30px; color: white;">
-        <h1 style="margin: 0 0 10px 0; color: {BRAND_COLORS['secondary']};"> Welcome, {user.name}!</h1>
-        <p style="margin: 0; color: {BRAND_COLORS['dark_gray']};">Select an action below to get started.</p>
-    </div>
-    """,
+<div style="background: linear-gradient(135deg, {BRAND_COLORS['primary']}, {BRAND_COLORS['secondary']});
+            padding: 30px; border-radius: 10px; margin-bottom: 30px; color: white;">
+  <h1 style="margin: 0 0 10px 0; color: {BRAND_COLORS['secondary']};"> Welcome, {user.name}!</h1>
+  <p style="margin: 0; color: {BRAND_COLORS['dark_gray']};">Select an action below to get started.</p>
+  <p style="margin: 8px 0 0 0; color: {BRAND_COLORS['dark_gray']};"><b>年度:</b> {year}</p>
+</div>
+""",
         unsafe_allow_html=True,
     )
-
-    year_badge()
 
     if user.role == "入力者":
         st.markdown("### 📝 Your Tasks")
@@ -1210,21 +1180,12 @@ def page_home() -> None:
             st.button("👥 Employee Master", use_container_width=True, on_click=set_page, args=("admin_employee_master",))
         with c3:
             st.button("📥 Export CSV", use_container_width=True, on_click=set_page, args=("admin_csv",))
-
-        c1, c2 = st.columns(2)
-        with c1:
+        c4, c5 = st.columns(2)
+        with c4:
             st.button("✔️ Approve Goals (HR)", use_container_width=True, on_click=set_page, args=("goal_approve_hr",))
-        with c2:
+        with c5:
             st.button("✔️ Approve Evaluations (HR)", use_container_width=True, on_click=set_page, args=("eval_approve_hr",))
 
-
-# ============================
-# Part 2 continues (Employee Master, Goals, Eval, 1on1, Dashboards, Router)
-# ============================
-
-# ============================
-# Part 2 (continue app.py)
-# ============================
 
 # ----------------------------
 # Admin: Employee Master + Reset + CSV Upload
@@ -1244,43 +1205,35 @@ def _parse_bool(v: Any, default: bool = False) -> bool:
     return default
 
 
+def _csv_template_text() -> str:
+    return (
+        "emp_no,name,email,department,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
+        "000002,山田太郎,yamada@example.com,Sales,1,0,1,1,010000,ChangeMe_1234\n"
+        "010000,佐藤花子,sato@example.com,Sales,1,0,1,0,,ChangeMe_1234\n"
+    )
+
+
 def _decode_csv_bytes(b: bytes) -> str:
-    """
-    CSV文字コードのフォールバック:
-    - UTF-8-SIG
-    - UTF-8
-    - CP932(=Shift_JIS系)
-    - Shift_JIS
-    """
-    for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+    # UTF-8(BOM含む) → CP932 → UTF-8(緩め) の順に試す
+    for enc in ("utf-8-sig", "cp932", "utf-8"):
         try:
             return b.decode(enc)
-        except Exception:
-            pass
-    # 最後の手段（壊れた文字は置換）
-    return b.decode("utf-8", errors="replace")
-
-
-def _csv_template_text() -> str:
-    # email列を追加（メール送信に使用）。空でも可。
-    return (
-        "emp_no,name,department,email,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
-        "000002,山田太郎,Sales,yamada@example.com,1,0,1,1,010000,ChangeMe_1234\n"
-        "010000,佐藤花子,Sales,sato@example.com,1,0,1,0,,ChangeMe_1234\n"
-    )
+        except UnicodeDecodeError:
+            continue
+    # 最後の手段：置換
+    return b.decode("cp932", errors="replace")
 
 
 def page_admin_employee_master() -> None:
     require_role("HR管理者")
-    section_title("Employee Master Management", "👥")
+    st.subheader("Employee Master Management")
 
-    section_title("CSV Upload", "📤")
+    st.markdown("### CSV Upload")
     st.caption(
-        "列: emp_no,name,department,email,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
-        "・passwordは空なら ChangeMe_1234 にします（初回ログインで変更必須）\n"
-        "・文字コードは UTF-8 / Shift_JIS(CP932) を自動判定します"
+        "列: emp_no,name,email,department,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
+        "※ active/role_* は 1/0 推奨（○/× でも可）\n"
+        "※ password が空なら ChangeMe_1234 を設定（初回ログイン時変更は必須）"
     )
-
     st.download_button(
         "CSVテンプレートをダウンロード",
         data=_csv_template_text().encode("utf-8"),
@@ -1306,9 +1259,8 @@ def page_admin_employee_master() -> None:
                     if not emp_no or not name:
                         continue
 
-                    department = str(row.get("department", "") or "").strip()
                     email = str(row.get("email", "") or "").strip() or None
-
+                    department = str(row.get("department", "") or "").strip()
                     active = _parse_bool(row.get("active", "1"), True)
                     role_admin = _parse_bool(row.get("role_admin", "0"), False)
                     role_manager = _parse_bool(row.get("role_manager", "0"), False)
@@ -1317,57 +1269,57 @@ def page_admin_employee_master() -> None:
 
                     password = str(row.get("password", "") or "").strip()
                     if not password:
-                        password = "ChangeMe_1234"
+                        password = DEFAULT_PASSWORD_IF_BLANK
 
                     existing = db.execute(select(Employee).where(Employee.emp_no == emp_no)).scalar_one_or_none()
                     if existing:
                         existing.name = name
-                        existing.department = department
                         existing.email = email
+                        existing.department = department
                         existing.active = active
                         existing.role_admin = role_admin
                         existing.role_manager = role_manager
                         existing.role_employee = role_employee
                         existing.manager_emp_no = manager_emp_no
-                        # パスワードは常にCSVの値を反映（運用上わかりやすく）
                         existing.password_hash = PWD_CONTEXT.hash(password)
                         existing.must_change_password = True
                         existing.password_updated_at = None
                         db.add(existing)
                         updated_count += 1
                     else:
-                        emp = Employee(
-                            emp_no=emp_no,
-                            name=name,
-                            department=department,
-                            email=email,
-                            password_hash=PWD_CONTEXT.hash(password),
-                            active=active,
-                            role_admin=role_admin,
-                            role_manager=role_manager,
-                            role_employee=role_employee,
-                            manager_emp_no=manager_emp_no,
-                            manager_email=None,
-                            must_change_password=True,
-                            password_updated_at=None,
-                            last_login_at=None,
+                        db.add(
+                            Employee(
+                                emp_no=emp_no,
+                                name=name,
+                                email=email,
+                                department=department,
+                                password_hash=PWD_CONTEXT.hash(password),
+                                active=active,
+                                role_admin=role_admin,
+                                role_manager=role_manager,
+                                role_employee=role_employee,
+                                manager_emp_no=manager_emp_no,
+                                manager_email=None,
+                                must_change_password=True,
+                                password_updated_at=None,
+                                last_login_at=None,
+                            )
                         )
-                        db.add(emp)
                         created_count += 1
+
                 db.commit()
 
             st.success(f"CSV取り込み完了：新規 {created_count} / 更新 {updated_count}")
-            st.info("※ 取り込み対象のユーザーは次回ログインでパスワード変更が必須です。")
 
     st.markdown("---")
-    section_title("Add/Update Manually", "✏️")
+    st.markdown("### Add/Update Manually")
 
     with st.form("emp_upsert", clear_on_submit=True):
         emp_no = st.text_input("従業員番号", placeholder="例: 000002")
         name = st.text_input("氏名", placeholder="例: 山田 太郎")
-        department = st.text_input("部署", placeholder="例: Sales")
         email = st.text_input("メールアドレス（任意）", placeholder="例: yamada@example.com")
-        password = st.text_input("パスワード（空なら ChangeMe_1234）", type="password")
+        department = st.text_input("部署", placeholder="例: Sales")
+        password = st.text_input("パスワード（空なら ChangeMe_1234 を設定）", type="password")
         active = st.checkbox("在籍", value=True)
 
         col1, col2, col3 = st.columns(3)
@@ -1388,13 +1340,16 @@ def page_admin_employee_master() -> None:
         elif not (role_admin or role_manager or role_employee):
             st.error("少なくとも1つの権限を付与してください。")
         else:
-            pw = password.strip() if password else "ChangeMe_1234"
+            pw = password.strip() if password else ""
+            if not pw:
+                pw = DEFAULT_PASSWORD_IF_BLANK
+
             with SessionLocal() as db:
                 existing = db.execute(select(Employee).where(Employee.emp_no == emp_no)).scalar_one_or_none()
                 if existing:
                     existing.name = name.strip()
-                    existing.department = department.strip()
                     existing.email = email.strip() or None
+                    existing.department = department.strip()
                     existing.active = bool(active)
                     existing.role_admin = bool(role_admin)
                     existing.role_manager = bool(role_manager)
@@ -1405,14 +1360,14 @@ def page_admin_employee_master() -> None:
                     existing.password_updated_at = None
                     db.add(existing)
                     db.commit()
-                    st.success("更新しました（次回ログインでPW変更必須）。")
+                    st.success("更新しました。")
                 else:
                     db.add(
                         Employee(
                             emp_no=emp_no,
                             name=name.strip(),
-                            department=department.strip(),
                             email=email.strip() or None,
+                            department=department.strip(),
                             password_hash=PWD_CONTEXT.hash(pw),
                             active=bool(active),
                             role_admin=bool(role_admin),
@@ -1426,7 +1381,7 @@ def page_admin_employee_master() -> None:
                         )
                     )
                     db.commit()
-                    st.success("追加しました（次回ログインでPW変更必須）。")
+                    st.success("追加しました。")
 
     st.markdown("---")
     st.write("従業員一覧 / リセット")
@@ -1443,18 +1398,20 @@ def page_admin_employee_master() -> None:
 
         colr1, colr2 = st.columns([1, 2])
         with colr1:
-            do_reset = st.button("パスワードを ChangeMe_1234 にリセット")
+            do_reset = st.button("一時パスワードを発行（リセット）")
         with colr2:
-            st.caption("リセット後、ユーザーは次回ログインで必ずPW変更します。")
+            st.caption("発行後、ユーザーは次回ログインで必ずPW変更します。")
 
         if do_reset:
+            temp_pw = _generate_temp_password()
             emp = db.execute(select(Employee).where(Employee.emp_no == selected_emp_no)).scalar_one()
-            emp.password_hash = PWD_CONTEXT.hash("ChangeMe_1234")
+            emp.password_hash = PWD_CONTEXT.hash(temp_pw)
             emp.must_change_password = True
             emp.password_updated_at = None
             db.add(emp)
             db.commit()
-            st.success("ChangeMe_1234 にリセットしました（次回ログインでPW変更必須）。")
+            st.warning("一時パスワード（必ず控えてください）")
+            st.code(temp_pw, language="text")
 
         rows = []
         for e in emps:
@@ -1462,8 +1419,8 @@ def page_admin_employee_master() -> None:
                 {
                     "従業員番号": e.emp_no,
                     "氏名": e.name,
+                    "メール": e.email or "",
                     "部署": e.department,
-                    "Email": e.email or "",
                     "在籍": "○" if e.active else "×",
                     "管理者": "○" if e.role_admin else "",
                     "評価者": "○" if e.role_manager else "",
@@ -1477,12 +1434,10 @@ def page_admin_employee_master() -> None:
         st.dataframe(rows, use_container_width=True)
 
 
-# ----------------------------
-# Goals: new input model
-# ----------------------------
-BUSINESS_MAX = 5
-DEV_MAX = 2
+# ---- Part 2 continues ----
 
+# ---- Part 2 ----
+# Goals (Employee) - New UI (business/dev) + date inputs + max limits
 
 def load_or_create_goal(db, emp_no: str, year: int) -> Goal:
     goal = db.execute(select(Goal).where(Goal.employee_emp_no == emp_no, Goal.year == year)).scalar_one_or_none()
@@ -1497,225 +1452,232 @@ def load_or_create_goal(db, emp_no: str, year: int) -> Goal:
     return goal
 
 
-def _biz_from_item(it: GoalItem) -> Dict[str, Any]:
-    # time_bound は "YYYY-MM-DD" を想定
-    d: Optional[date] = None
-    try:
-        d = datetime.strptime((it.time_bound or "")[:10], "%Y-%m-%d").date()
-    except Exception:
-        d = None
-    return {
-        "対象業務": it.specific or "",
-        "達成したい結果": it.measurable or "",
-        "期限": d,
-        "部署ゴールとの関連性": it.relevant or "",
-        "実行計画（任意）": it.achievable or "",
-        "Weight(合計100)": int(it.weight or 0),
-    }
-
-
-def _dev_from_item(it: GoalItem) -> Dict[str, Any]:
-    d: Optional[date] = None
-    try:
-        d = datetime.strptime((it.time_bound or "")[:10], "%Y-%m-%d").date()
-    except Exception:
-        d = None
-    return {
-        "なりたい人物像/身につけたいスキル": it.career_vision or "",
-        "現在の自分とのギャップ": it.measurable or "",
-        "どのような行動を行いますか？": it.relevant or "",
-        "実行計画（任意）": it.achievable or "",
-        "完了時期（任意）": d,
-    }
-
-
-def _validate_goal_new(biz_rows: List[Dict[str, Any]], dev_rows: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+def _validate_business_items(items: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
     errs: List[str] = []
 
-    if len(biz_rows) > BUSINESS_MAX:
-        errs.append(f"business goal は最大 {BUSINESS_MAX} 件です。")
-    if len(dev_rows) > DEV_MAX:
-        errs.append(f"development goal は最大 {DEV_MAX} 件です。")
+    filled = [r for r in items if any(str(r.get(k, "")).strip() for k in ["対象業務", "達成したい結果", "期限", "部署ゴールとの関連性", "実行計画"])]
+    if not filled:
+        return True, []  # businessは0件でもOK（devがあるかは全体で判定）
 
-    def nonempty(x: Any) -> bool:
-        return bool(str(x or "").strip())
-
-    # business: 対象/結果/期限/関連性 必須, 実行計画 任意
-    wsum = 0
-    for i, r in enumerate(biz_rows, start=1):
-        if not nonempty(r.get("対象業務")):
-            errs.append(f"business #{i}: 対象業務 は必須です。")
-        if not nonempty(r.get("達成したい結果")):
-            errs.append(f"business #{i}: 達成したい結果 は必須です。")
+    # 必須（実行計画のみ任意）
+    for i, r in enumerate(filled, start=1):
+        if not str(r.get("対象業務", "")).strip():
+            errs.append(f"Business #{i}: 「今回の対象となる業務」は必須です。")
+        if not str(r.get("達成したい結果", "")).strip():
+            errs.append(f"Business #{i}: 「達成したい結果」は必須です。")
         if not isinstance(r.get("期限"), date):
-            errs.append(f"business #{i}: 期限 は日付で入力してください。")
-        if not nonempty(r.get("部署ゴールとの関連性")):
-            errs.append(f"business #{i}: 部署ゴールとの関連性 は必須です。")
+            errs.append(f"Business #{i}: 「期限」は日付で指定してください。")
+        if not str(r.get("部署ゴールとの関連性", "")).strip():
+            errs.append(f"Business #{i}: 「部署ゴールとの関連性」は必須です。")
+
+        # Weightは必要（what計算に使用）
         try:
-            w = int(r.get("Weight(合計100)", 0))
+            w = int(r.get("Weight", 0))
             if w < 0 or w > 100:
-                errs.append(f"business #{i}: Weight は 0〜100 です。")
-            wsum += w
+                errs.append(f"Business #{i}: Weight は 0〜100 です。")
         except Exception:
-            errs.append(f"business #{i}: Weight は数値で入力してください。")
+            errs.append(f"Business #{i}: Weight は数値で入力してください。")
 
-    if biz_rows and wsum != 100:
-        errs.append(f"business goal の Weight 合計が 100 ではありません（現在: {wsum}）。")
-
-    # development: 人物像/ギャップ/行動 必須、実行計画/完了時期 任意
-    for i, r in enumerate(dev_rows, start=1):
-        if not nonempty(r.get("なりたい人物像/身につけたいスキル")):
-            errs.append(f"development #{i}: なりたい人物像/身につけたいスキル は必須です。")
-        if not nonempty(r.get("現在の自分とのギャップ")):
-            errs.append(f"development #{i}: 現在の自分とのギャップ は必須です。")
-        if not nonempty(r.get("どのような行動を行いますか？")):
-            errs.append(f"development #{i}: 行動 は必須です。")
-        # 完了時期は任意（date or None）
+    wsum = 0
+    for r in filled:
+        try:
+            wsum += int(r.get("Weight", 0))
+        except Exception:
+            pass
+    if filled and wsum != 100:
+        errs.append(f"Business: Weight 合計が 100 ではありません（現在: {wsum}）。")
 
     return (len(errs) == 0), errs
 
 
+def _validate_dev_items(items: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+    errs: List[str] = []
+    filled = [r for r in items if any(str(r.get(k, "")).strip() for k in ["なりたい人物像/身につけたいスキル", "現在の自分とのギャップ", "どのような行動を行いますか？", "実行計画", "完了時期"])]
+    if not filled:
+        return True, []
+
+    for i, r in enumerate(filled, start=1):
+        if not str(r.get("なりたい人物像/身につけたいスキル", "")).strip():
+            errs.append(f"Development #{i}: 「なりたい人物像/身につけたいスキル」は必須です。")
+        if not str(r.get("現在の自分とのギャップ", "")).strip():
+            errs.append(f"Development #{i}: 「現在の自分とのギャップ」は必須です。")
+        if not str(r.get("どのような行動を行いますか？", "")).strip():
+            errs.append(f"Development #{i}: 「どのような行動を行いますか？」は必須です。")
+        # 実行計画/完了時期は任意（完了時期は date or None）
+
+    return (len(errs) == 0), errs
+
+
+def _initial_business_rows_from_goal(goal: Goal) -> List[Dict[str, Any]]:
+    biz = [it for it in goal.items if it.type == "business"]
+    rows: List[Dict[str, Any]] = []
+    for it in biz[:BUSINESS_GOAL_MAX]:
+        rows.append(
+            {
+                "対象業務": it.specific,
+                "達成したい結果": it.measurable,
+                "期限": parse_iso_date(it.time_bound) or date.today(),
+                "部署ゴールとの関連性": it.relevant,
+                "実行計画": it.achievable or "",
+                "Weight": int(it.weight or 0),
+            }
+        )
+    while len(rows) < BUSINESS_GOAL_MAX:
+        rows.append(
+            {
+                "対象業務": "",
+                "達成したい結果": "",
+                "期限": date.today(),
+                "部署ゴールとの関連性": "",
+                "実行計画": "",
+                "Weight": 0 if rows else 100,  # 1件目は100を初期値
+            }
+        )
+    return rows
+
+
+def _initial_dev_rows_from_goal(goal: Goal) -> List[Dict[str, Any]]:
+    dev = [it for it in goal.items if it.type == "development"]
+    rows: List[Dict[str, Any]] = []
+    for it in dev[:DEVELOPMENT_GOAL_MAX]:
+        rows.append(
+            {
+                "なりたい人物像/身につけたいスキル": it.specific,
+                "現在の自分とのギャップ": it.measurable,
+                "どのような行動を行いますか？": it.relevant,
+                "実行計画": it.achievable or "",
+                "完了時期": parse_iso_date(it.time_bound),
+            }
+        )
+    while len(rows) < DEVELOPMENT_GOAL_MAX:
+        rows.append(
+            {
+                "なりたい人物像/身につけたいスキル": "",
+                "現在の自分とのギャップ": "",
+                "どのような行動を行いますか？": "",
+                "実行計画": "",
+                "完了時期": None,
+            }
+        )
+    return rows
+
+
 def page_goal_input() -> None:
     user = require_role("入力者")
-    section_title("Goal Input", "🎯")
     year = get_selected_year()
+
+    st.subheader("目標入力（新フォーマット）")
+    st.caption(f"年度: {year} / business最大{BUSINESS_GOAL_MAX}件・development最大{DEVELOPMENT_GOAL_MAX}件")
 
     with SessionLocal() as db:
         emp = db.execute(select(Employee).where(Employee.emp_no == user.emp_no)).scalar_one()
+        goal = load_or_create_goal(db, user.emp_no, year)
+        st.caption(f"状態: {status_label_goal(goal.status)}")
+        editable = can_edit_goal(goal.status)
+
         if not emp.manager_emp_no:
             st.warning("従業員マスタで上長が設定されていません。Submitできません。")
 
-        goal = load_or_create_goal(db, user.emp_no, year)
-        st.caption(f"年度: {year} / 状態: {status_label_goal(goal.status)}")
-        editable = can_edit_goal(goal.status)
-
-        # load existing to session
-        state_key = f"goal_new:{user.emp_no}:{year}"
+        state_key = f"goalui:{user.emp_no}:{year}"
         if state_key not in st.session_state:
-            biz_items = [it for it in goal.items if it.type == "business"]
-            dev_items = [it for it in goal.items if it.type == "development"]
             st.session_state[state_key] = {
-                "biz": [_biz_from_item(it) for it in biz_items] or [],
-                "dev": [_dev_from_item(it) for it in dev_items] or [],
+                "biz": _initial_business_rows_from_goal(goal),
+                "dev": _initial_dev_rows_from_goal(goal),
             }
 
-        # BUSINESS
-        st.subheader("Business Goal（最大5件）")
-        st.caption("①対象業務 ②達成したい結果 ③期限（必須/日付） ④部署ゴールとの関連性 ＋ 実行計画（任意）")
+        st.markdown("## ① Business goals（評価対象）")
+        st.caption("必須: 対象業務 / 達成したい結果 / 期限(日付) / 部署ゴールとの関連性　任意: 実行計画")
+
         biz_rows: List[Dict[str, Any]] = st.session_state[state_key]["biz"]
-
-        # 表示・編集（最大5件）
-        for idx in range(BUSINESS_MAX):
-            existing = biz_rows[idx] if idx < len(biz_rows) else None
-            with st.expander(f"Business #{idx+1}", expanded=(idx == 0 and not biz_rows)):
-                enabled = editable
-                c1, c2 = st.columns(2)
-                with c1:
-                    target = st.text_input("① 今回の対象となる業務", value=(existing or {}).get("対象業務", ""), key=f"biz_target_{idx}", disabled=not enabled)
-                    result = st.text_area("② 達成したい結果", value=(existing or {}).get("達成したい結果", ""), key=f"biz_result_{idx}", disabled=not enabled)
-                    rel = st.text_area("④ 部署ゴールとの関連性", value=(existing or {}).get("部署ゴールとの関連性", ""), key=f"biz_rel_{idx}", disabled=not enabled)
-                with c2:
-                    # 期限必須
-                    default_d = (existing or {}).get("期限") or date.today()
-                    deadline = st.date_input("③ 期限（必須）", value=default_d, key=f"biz_deadline_{idx}", disabled=not enabled)
-                    plan = st.text_area("実行計画（任意）", value=(existing or {}).get("実行計画（任意）", ""), key=f"biz_plan_{idx}", disabled=not enabled)
-                    w = st.number_input("Weight(合計100)", min_value=0, max_value=100, value=int((existing or {}).get("Weight(合計100)", 0) or 0), step=1, key=f"biz_weight_{idx}", disabled=not enabled)
-
-                # 空なら保存しない（全項目空の場合）
-                if any(str(x).strip() for x in [target, result, rel, plan]) or (existing is not None):
-                    if idx < len(biz_rows):
-                        biz_rows[idx] = {
-                            "対象業務": target,
-                            "達成したい結果": result,
-                            "期限": deadline,
-                            "部署ゴールとの関連性": rel,
-                            "実行計画（任意）": plan,
-                            "Weight(合計100)": int(w),
-                        }
-                    else:
-                        # 追加枠
-                        if any(str(x).strip() for x in [target, result, rel, plan]):
-                            biz_rows.append(
-                                {
-                                    "対象業務": target,
-                                    "達成したい結果": result,
-                                    "期限": deadline,
-                                    "部署ゴールとの関連性": rel,
-                                    "実行計画（任意）": plan,
-                                    "Weight(合計100)": int(w),
-                                }
-                            )
-
-        # DEV
-        st.subheader("Development Goal（最大2件）")
-        st.caption("①人物像/スキル ②ギャップ ③行動 ＋ 実行計画（任意）＋ 完了時期（任意/日付）")
-        dev_rows: List[Dict[str, Any]] = st.session_state[state_key]["dev"]
-
-        for idx in range(DEV_MAX):
-            existing = dev_rows[idx] if idx < len(dev_rows) else None
-            with st.expander(f"Development #{idx+1}", expanded=(idx == 0 and not dev_rows)):
-                enabled = editable
-                vision = st.text_input(
-                    "① なりたい人物像/身につけたいスキル",
-                    value=(existing or {}).get("なりたい人物像/身につけたいスキル", ""),
-                    key=f"dev_vision_{idx}",
-                    disabled=not enabled,
+        for i in range(BUSINESS_GOAL_MAX):
+            with st.expander(f"Business #{i+1}", expanded=(i == 0)):
+                biz_rows[i]["対象業務"] = st.text_area(
+                    "① 今回の対象となる業務",
+                    value=biz_rows[i].get("対象業務", ""),
+                    disabled=not editable,
+                    key=f"biz_target_{state_key}_{i}",
                 )
-                gap = st.text_area(
-                    "② 現在の自分とのギャップ",
-                    value=(existing or {}).get("現在の自分とのギャップ", ""),
-                    key=f"dev_gap_{idx}",
-                    disabled=not enabled,
+                biz_rows[i]["達成したい結果"] = st.text_area(
+                    "② 達成したい結果",
+                    value=biz_rows[i].get("達成したい結果", ""),
+                    disabled=not editable,
+                    key=f"biz_result_{state_key}_{i}",
                 )
-                action = st.text_area(
-                    "③ どのような行動を行いますか？",
-                    value=(existing or {}).get("どのような行動を行いますか？", ""),
-                    key=f"dev_action_{idx}",
-                    disabled=not enabled,
+                biz_rows[i]["期限"] = st.date_input(
+                    "③ 期限",
+                    value=biz_rows[i].get("期限") or date.today(),
+                    disabled=not editable,
+                    key=f"biz_deadline_{state_key}_{i}",
                 )
-                plan = st.text_area(
+                biz_rows[i]["部署ゴールとの関連性"] = st.text_area(
+                    "④ 部署ゴールとの関連性",
+                    value=biz_rows[i].get("部署ゴールとの関連性", ""),
+                    disabled=not editable,
+                    key=f"biz_align_{state_key}_{i}",
+                )
+                biz_rows[i]["実行計画"] = st.text_area(
                     "実行計画（任意）",
-                    value=(existing or {}).get("実行計画（任意）", ""),
-                    key=f"dev_plan_{idx}",
-                    disabled=not enabled,
+                    value=biz_rows[i].get("実行計画", ""),
+                    disabled=not editable,
+                    key=f"biz_plan_{state_key}_{i}",
                 )
-                d_default = (existing or {}).get("完了時期（任意）")
-                use_date = st.checkbox("完了時期を入力する（任意）", value=bool(d_default), key=f"dev_use_date_{idx}", disabled=not enabled)
-                comp = st.date_input(
+                biz_rows[i]["Weight"] = st.number_input(
+                    "Weight（合計100）",
+                    min_value=0,
+                    max_value=100,
+                    value=int(biz_rows[i].get("Weight") or 0),
+                    step=1,
+                    disabled=not editable,
+                    key=f"biz_weight_{state_key}_{i}",
+                )
+
+        st.markdown("## ② Development goals（キャリア）")
+        st.caption("必須: なりたい人物像/スキル / ギャップ / 行動　任意: 実行計画 / 完了時期(日付)")
+        dev_rows: List[Dict[str, Any]] = st.session_state[state_key]["dev"]
+        for i in range(DEVELOPMENT_GOAL_MAX):
+            with st.expander(f"Development #{i+1}", expanded=(i == 0)):
+                dev_rows[i]["なりたい人物像/身につけたいスキル"] = st.text_area(
+                    "① なりたい人物像/身につけたいスキル",
+                    value=dev_rows[i].get("なりたい人物像/身につけたいスキル", ""),
+                    disabled=not editable,
+                    key=f"dev_vision_{state_key}_{i}",
+                )
+                dev_rows[i]["現在の自分とのギャップ"] = st.text_area(
+                    "② 現在の自分とのギャップ",
+                    value=dev_rows[i].get("現在の自分とのギャップ", ""),
+                    disabled=not editable,
+                    key=f"dev_gap_{state_key}_{i}",
+                )
+                dev_rows[i]["どのような行動を行いますか？"] = st.text_area(
+                    "③ どのような行動を行いますか？",
+                    value=dev_rows[i].get("どのような行動を行いますか？", ""),
+                    disabled=not editable,
+                    key=f"dev_action_{state_key}_{i}",
+                )
+                dev_rows[i]["実行計画"] = st.text_area(
+                    "実行計画（任意）",
+                    value=dev_rows[i].get("実行計画", ""),
+                    disabled=not editable,
+                    key=f"dev_plan_{state_key}_{i}",
+                )
+                dev_rows[i]["完了時期"] = st.date_input(
                     "完了時期（任意）",
-                    value=(d_default or date.today()),
-                    key=f"dev_comp_{idx}",
-                    disabled=(not enabled) or (not use_date),
+                    value=dev_rows[i].get("完了時期") or date.today(),
+                    disabled=not editable,
+                    key=f"dev_done_{state_key}_{i}",
                 )
-                comp_val = comp if use_date else None
+                # 任意にしたいので、未入力相当を作るチェック
+                dev_rows[i]["完了時期_任意"] = st.checkbox(
+                    "完了時期は未設定（任意）",
+                    value=(dev_rows[i].get("完了時期") is None),
+                    disabled=not editable,
+                    key=f"dev_done_none_{state_key}_{i}",
+                )
+                if dev_rows[i]["完了時期_任意"]:
+                    dev_rows[i]["完了時期"] = None
 
-                if any(str(x).strip() for x in [vision, gap, action, plan]) or (existing is not None):
-                    if idx < len(dev_rows):
-                        dev_rows[idx] = {
-                            "なりたい人物像/身につけたいスキル": vision,
-                            "現在の自分とのギャップ": gap,
-                            "どのような行動を行いますか？": action,
-                            "実行計画（任意）": plan,
-                            "完了時期（任意）": comp_val,
-                        }
-                    else:
-                        if any(str(x).strip() for x in [vision, gap, action, plan]):
-                            dev_rows.append(
-                                {
-                                    "なりたい人物像/身につけたいスキル": vision,
-                                    "現在の自分とのギャップ": gap,
-                                    "どのような行動を行いますか？": action,
-                                    "実行計画（任意）": plan,
-                                    "完了時期（任意）": comp_val,
-                                }
-                            )
-
-        # trim empty rows
-        biz_trim = [r for r in biz_rows if any(str(r.get(k, "")).strip() for k in ["対象業務", "達成したい結果", "部署ゴールとの関連性", "実行計画（任意）"])]
-        dev_trim = [r for r in dev_rows if any(str(r.get(k, "")).strip() for k in ["なりたい人物像/身につけたいスキル", "現在の自分とのギャップ", "どのような行動を行いますか？", "実行計画（任意）"])]
-
-        st.session_state[state_key]["biz"] = biz_trim
-        st.session_state[state_key]["dev"] = dev_trim
+        st.session_state[state_key]["biz"] = biz_rows
+        st.session_state[state_key]["dev"] = dev_rows
 
         st.markdown("---")
         c1, c2, c3 = st.columns([1, 1, 2])
@@ -1731,11 +1693,21 @@ def page_goal_input() -> None:
                 st.error("上長が設定されていないためSubmitできません。")
                 st.stop()
 
-            ok, errors = _validate_goal_new(biz_trim, dev_trim)
-            if not ok:
+            # validate
+            ok1, e1 = _validate_business_items(biz_rows)
+            ok2, e2 = _validate_dev_items(dev_rows)
+            errs = e1 + e2
+
+            # 全体で1件以上（biz or dev）
+            any_biz = any(str(r.get("対象業務", "")).strip() for r in biz_rows)
+            any_dev = any(str(r.get("なりたい人物像/身につけたいスキル", "")).strip() for r in dev_rows)
+            if not (any_biz or any_dev):
+                errs.append("Business または Development を1件以上入力してください。")
+
+            if not (ok1 and ok2) or errs:
                 st.error("入力に不備があります。")
-                for e in errors:
-                    st.write(f"- {e}")
+                for msg in errs:
+                    st.write(f"- {msg}")
                 st.stop()
 
             goal = load_or_create_goal(db, user.emp_no, year)
@@ -1743,43 +1715,50 @@ def page_goal_input() -> None:
                 st.error("この目標は編集できない状態です。")
                 st.stop()
 
-            # replace items
+            # rerun/別セッション対策
+            goal = attach(db, goal)
+
+            # delete old items
             for it in list(goal.items):
                 db.delete(it)
             db.flush()
 
-            # persist business
-            for r in biz_trim:
-                deadline: date = r["期限"]
+            # insert business
+            for r in biz_rows:
+                if not any(str(r.get(k, "")).strip() for k in ["対象業務", "達成したい結果", "部署ゴールとの関連性", "実行計画"]) and not isinstance(r.get("期限"), date):
+                    continue
+                if not str(r.get("対象業務", "")).strip():
+                    continue  # 空はスキップ
                 db.add(
                     GoalItem(
                         goal_id=goal.id,
                         type="business",
-                        specific=str(r["対象業務"]).strip(),
-                        measurable=str(r["達成したい結果"]).strip(),
-                        achievable=str(r.get("実行計画（任意）") or "").strip(),  # 任意（空OK）
-                        relevant=str(r["部署ゴールとの関連性"]).strip(),
-                        time_bound=deadline.isoformat(),  # YYYY-MM-DD
+                        specific=str(r.get("対象業務", "")).strip(),
+                        measurable=str(r.get("達成したい結果", "")).strip(),
+                        relevant=str(r.get("部署ゴールとの関連性", "")).strip(),
+                        achievable=str(r.get("実行計画", "") or "").strip(),
+                        time_bound=to_iso_date(r.get("期限")),
                         career_vision=None,
-                        weight=int(r["Weight(合計100)"]),
-                        achieved_percent=0,  # 評価時に入力
+                        weight=int(r.get("Weight") or 0),
+                        achieved_percent=int(0),
                     )
                 )
 
-            # persist development
-            for r in dev_trim:
-                comp: Optional[date] = r.get("完了時期（任意）")
+            # insert development
+            for r in dev_rows:
+                if not str(r.get("なりたい人物像/身につけたいスキル", "")).strip():
+                    continue
+                done = r.get("完了時期")
                 db.add(
                     GoalItem(
                         goal_id=goal.id,
                         type="development",
-                        # 未使用のフィールドは固定値
-                        specific="(development)",
-                        measurable=str(r["現在の自分とのギャップ"]).strip(),
-                        achievable=str(r.get("実行計画（任意）") or "").strip(),  # 任意（空OK）
-                        relevant=str(r["どのような行動を行いますか？"]).strip(),
-                        time_bound=(comp.isoformat() if isinstance(comp, date) else ""),  # 任意（空OK）
-                        career_vision=str(r["なりたい人物像/身につけたいスキル"]).strip(),
+                        specific=str(r.get("なりたい人物像/身につけたいスキル", "")).strip(),
+                        measurable=str(r.get("現在の自分とのギャップ", "")).strip(),
+                        relevant=str(r.get("どのような行動を行いますか？", "")).strip(),
+                        achievable=str(r.get("実行計画", "") or "").strip(),
+                        time_bound=to_iso_date(done) if isinstance(done, date) else "",
+                        career_vision=None,
                         weight=None,
                         achieved_percent=None,
                     )
@@ -1792,24 +1771,28 @@ def page_goal_input() -> None:
                 goal.status = "submitted"
                 db.add(GoalApproval(goal_id=goal.id, stage="employee", action="submit", comment="", actor_emp_no=user.emp_no))
 
+            # ここが以前落ちた箇所：merge済みのgoalをaddする
             db.add(goal)
             db.commit()
+
             st.success("保存しました。" if save else "上長へ承認依頼しました。")
 
-            # email notify
             if submit:
+                emp_email = emp.email
                 manager = db.execute(select(Employee).where(Employee.emp_no == emp.manager_emp_no)).scalar_one_or_none()
-                if emp.email:
+                manager_email = manager.email if manager else None
+
+                if manager_email:
                     send_email(
-                        emp.email,
-                        f"【目標管理】目標を提出しました（{year}年度）",
-                        f"こんにちは {user.name}さん,\n\nあなたが目標を上長に提出しました。\n承認をお待ちしています。\n\n---\n本メールは自動送信されています。",
-                    )
-                if manager and manager.email:
-                    send_email(
-                        manager.email,
+                        manager_email,
                         f"【目標管理】{user.name}さんが目標を提出しました（{year}年度）",
                         f"こんにちは、\n\n{user.name}さんが{year}年度の目標を提出しました。\n確認・承認をお願いいたします。\n\n---\n本メールは自動送信されています。",
+                    )
+                if emp_email:
+                    send_email(
+                        emp_email,
+                        f"【目標管理】目標を提出しました（{year}年度）",
+                        f"こんにちは {user.name}さん,\n\nあなたが目標を上長に提出しました。\n承認をお待ちしています。\n\n---\n本メールは自動送信されています。",
                     )
 
             st.session_state.pop(state_key, None)
@@ -1818,9 +1801,9 @@ def page_goal_input() -> None:
 
 def page_goal_view_self() -> None:
     user = require_role("入力者")
-    section_title("目標閲覧（自分）", "👁️")
     year = get_selected_year()
 
+    st.subheader("目標閲覧（自分）")
     with SessionLocal() as db:
         goal = db.execute(select(Goal).where(Goal.employee_emp_no == user.emp_no, Goal.year == year)).scalar_one_or_none()
         if not goal:
@@ -1834,33 +1817,30 @@ def page_goal_view_self() -> None:
         biz = [it for it in items if it.type == "business"]
         dev = [it for it in items if it.type == "development"]
 
-        st.subheader("Business Goal")
+        st.markdown("### Business goals")
         if not biz:
             st.write("（なし）")
         for idx, it in enumerate(biz, start=1):
-            with st.expander(f"Business #{idx}（Weight {it.weight} / 期限 {format_jp_date(it.time_bound)}）"):
-                st.write(f"① 対象業務: {it.specific}")
-                st.write(f"② 達成したい結果: {it.measurable}")
-                st.write(f"③ 期限: {format_jp_date(it.time_bound)}")
-                st.write(f"④ 部署ゴールとの関連性: {it.relevant}")
-                if (it.achievable or "").strip():
-                    st.write(f"実行計画（任意）: {it.achievable}")
+            with st.expander(f"Business #{idx}（Weight {it.weight}）"):
+                st.write(f"**① 対象業務**: {it.specific}")
+                st.write(f"**② 達成したい結果**: {it.measurable}")
+                st.write(f"**③ 期限**: {it.time_bound}")
+                st.write(f"**④ 部署ゴールとの関連性**: {it.relevant}")
+                st.write(f"**実行計画（任意）**: {it.achievable}")
 
-        st.subheader("Development Goal")
+        st.markdown("### Development goals")
         if not dev:
             st.write("（なし）")
         for idx, it in enumerate(dev, start=1):
-            with st.expander(f"Development #{idx}（完了時期 {format_jp_date(it.time_bound)}）"):
-                st.write(f"① なりたい人物像/身につけたいスキル: {it.career_vision or ''}")
-                st.write(f"② 現在の自分とのギャップ: {it.measurable}")
-                st.write(f"③ 行動: {it.relevant}")
-                if (it.achievable or "").strip():
-                    st.write(f"実行計画（任意）: {it.achievable}")
-                if (it.time_bound or "").strip():
-                    st.write(f"完了時期（任意）: {format_jp_date(it.time_bound)}")
+            with st.expander(f"Development #{idx}"):
+                st.write(f"**① なりたい人物像/身につけたいスキル**: {it.specific}")
+                st.write(f"**② 現在の自分とのギャップ**: {it.measurable}")
+                st.write(f"**③ 行動**: {it.relevant}")
+                st.write(f"**実行計画（任意）**: {it.achievable}")
+                st.write(f"**完了時期（任意）**: {it.time_bound or '（未設定）'}")
 
         st.markdown("---")
-        st.subheader("承認ログ")
+        st.markdown("### 承認ログ")
         rows = [
             {
                 "日時": a.acted_at.strftime("%Y-%m-%d %H:%M"),
@@ -1876,9 +1856,9 @@ def page_goal_view_self() -> None:
 
 def page_goal_view_manager() -> None:
     user = require_role("評価者")
-    section_title("部下目標 閲覧（上長・閲覧専用）", "📂")
     year = get_selected_year()
 
+    st.subheader("部下目標 閲覧（上長・閲覧専用）")
     with SessionLocal() as db:
         subs = db.execute(select(Employee).where(Employee.manager_emp_no == user.emp_no, Employee.active.is_(True))).scalars().all()
         if not subs:
@@ -1899,35 +1879,29 @@ def page_goal_view_manager() -> None:
         biz = [it for it in items if it.type == "business"]
         dev = [it for it in items if it.type == "development"]
 
-        st.subheader("Business Goal")
+        st.markdown("### Business goals")
         for idx, it in enumerate(biz, start=1):
-            with st.expander(f"Business #{idx}（Weight {it.weight} / 期限 {format_jp_date(it.time_bound)}）"):
-                st.write(f"① 対象業務: {it.specific}")
-                st.write(f"② 達成したい結果: {it.measurable}")
-                st.write(f"③ 期限: {format_jp_date(it.time_bound)}")
-                st.write(f"④ 部署ゴールとの関連性: {it.relevant}")
-                if (it.achievable or "").strip():
-                    st.write(f"実行計画（任意）: {it.achievable}")
+            with st.expander(f"Business #{idx}（Weight {it.weight}）"):
+                st.write(f"**① 対象業務**: {it.specific}")
+                st.write(f"**② 達成したい結果**: {it.measurable}")
+                st.write(f"**③ 期限**: {it.time_bound}")
+                st.write(f"**④ 部署ゴールとの関連性**: {it.relevant}")
+                st.write(f"**実行計画（任意）**: {it.achievable}")
 
-        st.subheader("Development Goal")
+        st.markdown("### Development goals")
         for idx, it in enumerate(dev, start=1):
-            with st.expander(f"Development #{idx}（完了時期 {format_jp_date(it.time_bound)}）"):
-                st.write(f"① なりたい人物像/身につけたいスキル: {it.career_vision or ''}")
-                st.write(f"② 現在の自分とのギャップ: {it.measurable}")
-                st.write(f"③ 行動: {it.relevant}")
-                if (it.achievable or "").strip():
-                    st.write(f"実行計画（任意）: {it.achievable}")
-                if (it.time_bound or "").strip():
-                    st.write(f"完了時期（任意）: {format_jp_date(it.time_bound)}")
+            with st.expander(f"Development #{idx}"):
+                st.write(f"**① なりたい人物像/身につけたいスキル**: {it.specific}")
+                st.write(f"**② 現在の自分とのギャップ**: {it.measurable}")
+                st.write(f"**③ 行動**: {it.relevant}")
+                st.write(f"**実行計画（任意）**: {it.achievable}")
+                st.write(f"**完了時期（任意）**: {it.time_bound or '（未設定）'}")
 
 
-# ----------------------------
-# Goals Approval (Manager / HR)
-# ----------------------------
 def page_goal_approve_manager() -> None:
     user = require_role("評価者")
-    section_title("部下目標 承認/差戻し（上長）", "✅")
     year = get_selected_year()
+    st.subheader("部下目標 承認/差戻し（上長）")
 
     with SessionLocal() as db:
         subs = db.execute(select(Employee).where(Employee.manager_emp_no == user.emp_no, Employee.active.is_(True))).scalars().all()
@@ -1945,37 +1919,32 @@ def page_goal_approve_manager() -> None:
             return
 
         st.caption(f"年度: {year} / 状態: {status_label_goal(goal.status)}")
-
         items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
-        biz = [it for it in items if it.type == "business"]
-        dev = [it for it in items if it.type == "development"]
 
-        st.subheader("目標内容（閲覧）")
-        for idx, it in enumerate(biz, start=1):
-            with st.expander(f"Business #{idx}（Weight {it.weight} / 期限 {format_jp_date(it.time_bound)}）"):
-                st.write(f"① 対象業務: {it.specific}")
-                st.write(f"② 達成したい結果: {it.measurable}")
-                st.write(f"③ 期限: {format_jp_date(it.time_bound)}")
-                st.write(f"④ 部署ゴールとの関連性: {it.relevant}")
-                if (it.achievable or "").strip():
-                    st.write(f"実行計画（任意）: {it.achievable}")
-
-        for idx, it in enumerate(dev, start=1):
-            with st.expander(f"Development #{idx}（完了時期 {format_jp_date(it.time_bound)}）"):
-                st.write(f"① なりたい人物像/身につけたいスキル: {it.career_vision or ''}")
-                st.write(f"② 現在の自分とのギャップ: {it.measurable}")
-                st.write(f"③ 行動: {it.relevant}")
-                if (it.achievable or "").strip():
-                    st.write(f"実行計画（任意）: {it.achievable}")
-                if (it.time_bound or "").strip():
-                    st.write(f"完了時期（任意）: {format_jp_date(it.time_bound)}")
+        st.markdown("### 目標内容")
+        for it in items:
+            if it.type == "business":
+                title = f"Business（Weight {it.weight}）"
+                with st.expander(title):
+                    st.write(f"**① 対象業務**: {it.specific}")
+                    st.write(f"**② 達成したい結果**: {it.measurable}")
+                    st.write(f"**③ 期限**: {it.time_bound}")
+                    st.write(f"**④ 部署ゴールとの関連性**: {it.relevant}")
+                    st.write(f"**実行計画（任意）**: {it.achievable}")
+            else:
+                with st.expander("Development"):
+                    st.write(f"**① なりたい人物像/身につけたいスキル**: {it.specific}")
+                    st.write(f"**② 現在の自分とのギャップ**: {it.measurable}")
+                    st.write(f"**③ 行動**: {it.relevant}")
+                    st.write(f"**実行計画（任意）**: {it.achievable}")
+                    st.write(f"**完了時期（任意）**: {it.time_bound or '（未設定）'}")
 
         if goal.status != "submitted":
             st.info("この目標は上長承認待ちではありません。")
             return
 
         st.markdown("---")
-        comment = st.text_area("コメント（差し戻し時は必須）")
+        comment = st.text_area("コメント（差し戻し時は必須）", key=f"gm_comment_{emp_no}_{year}")
         c1, c2 = st.columns(2)
         with c1:
             approve = st.button("承認（HRへ提出）", use_container_width=True)
@@ -1983,6 +1952,7 @@ def page_goal_approve_manager() -> None:
             ret = st.button("差し戻し", use_container_width=True)
 
         if approve:
+            goal = attach(db, goal)
             goal.status = "manager_approved"
             db.add(goal)
             db.add(GoalApproval(goal_id=goal.id, stage="manager", action="approve", comment=comment.strip(), actor_emp_no=user.emp_no))
@@ -1990,22 +1960,21 @@ def page_goal_approve_manager() -> None:
             st.success("承認しました（HRへ提出）。")
 
             emp = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
-            hr_admins = db.execute(select(Employee).where(Employee.role_admin.is_(True))).scalars().all()
-            subject = f"【目標管理】{emp.name if emp else ''}さんの目標が上長承認されました"
-            body = (
-                "こんにちは,\n\n"
-                f"{emp.name if emp else ''}さんの{goal.year}年度の目標が上長（{user.name}さん）に承認されました。\n"
-                "確認をお願いいたします。\n\n---\n本メールは自動送信されています。"
-            )
-            for hr in hr_admins:
-                if hr.email:
-                    send_email(hr.email, subject, body)
+            hr_admins = db.execute(select(Employee).where(Employee.role_admin == True)).scalars().all()
+            for hr_admin in hr_admins:
+                if hr_admin.email:
+                    send_email(
+                        hr_admin.email,
+                        f"【目標管理】{emp.name if emp else ''}さんの目標が上長承認されました",
+                        f"こんにちは,\n\n{emp.name if emp else ''}さんの{goal.year}年度の目標が上長（{user.name}さん）に承認されました。\n確認をお願いいたします。\n\n---\n本メールは自動送信されています。",
+                    )
             st.rerun()
 
         if ret:
             if not comment.strip():
                 st.error("差し戻し時はコメントが必須です。")
                 st.stop()
+            goal = attach(db, goal)
             goal.status = "manager_returned"
             db.add(goal)
             db.add(GoalApproval(goal_id=goal.id, stage="manager", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
@@ -2016,8 +1985,8 @@ def page_goal_approve_manager() -> None:
 
 def page_goal_approve_hr() -> None:
     user = require_role("HR管理者")
-    section_title("Confirm Goals (HR)", "✔️")
     year = get_selected_year()
+    st.subheader("Confirm Goals (HR)")
 
     with SessionLocal() as db:
         candidates = db.execute(
@@ -2034,33 +2003,28 @@ def page_goal_approve_hr() -> None:
 
         label = st.selectbox("対象を選択", list(options.keys()))
         goal_id = options[label]
-
         goal = db.execute(select(Goal).where(Goal.id == goal_id)).scalar_one()
         items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
 
         st.caption(f"年度: {year} / 状態: {status_label_goal(goal.status)}")
-
-        st.subheader("目標内容（閲覧）")
+        st.markdown("### 目標内容")
         for it in items:
             if it.type == "business":
-                with st.expander(f"Business（Weight {it.weight} / 期限 {format_jp_date(it.time_bound)}）"):
-                    st.write(f"① 対象業務: {it.specific}")
-                    st.write(f"② 達成したい結果: {it.measurable}")
-                    st.write(f"③ 期限: {format_jp_date(it.time_bound)}")
-                    st.write(f"④ 部署ゴールとの関連性: {it.relevant}")
-                    if (it.achievable or "").strip():
-                        st.write(f"実行計画（任意）: {it.achievable}")
+                with st.expander(f"Business（Weight {it.weight}）"):
+                    st.write(f"**① 対象業務**: {it.specific}")
+                    st.write(f"**② 達成したい結果**: {it.measurable}")
+                    st.write(f"**③ 期限**: {it.time_bound}")
+                    st.write(f"**④ 部署ゴールとの関連性**: {it.relevant}")
+                    st.write(f"**実行計画（任意）**: {it.achievable}")
             else:
-                with st.expander(f"Development（完了時期 {format_jp_date(it.time_bound)}）"):
-                    st.write(f"① なりたい人物像/身につけたいスキル: {it.career_vision or ''}")
-                    st.write(f"② 現在の自分とのギャップ: {it.measurable}")
-                    st.write(f"③ 行動: {it.relevant}")
-                    if (it.achievable or "").strip():
-                        st.write(f"実行計画（任意）: {it.achievable}")
-                    if (it.time_bound or "").strip():
-                        st.write(f"完了時期（任意）: {format_jp_date(it.time_bound)}")
+                with st.expander("Development"):
+                    st.write(f"**① なりたい人物像/身につけたいスキル**: {it.specific}")
+                    st.write(f"**② 現在の自分とのギャップ**: {it.measurable}")
+                    st.write(f"**③ 行動**: {it.relevant}")
+                    st.write(f"**実行計画（任意）**: {it.achievable}")
+                    st.write(f"**完了時期（任意）**: {it.time_bound or '（未設定）'}")
 
-        comment = st.text_area("コメント（差し戻し時は必須）")
+        comment = st.text_area("コメント（差し戻し時は必須）", key=f"gh_comment_{goal_id}")
         c1, c2 = st.columns(2)
         with c1:
             approve = st.button("HR確認（公開）", use_container_width=True)
@@ -2068,6 +2032,7 @@ def page_goal_approve_hr() -> None:
             ret = st.button("差し戻し（社員へ）", use_container_width=True)
 
         if approve:
+            goal = attach(db, goal)
             goal.status = "hr_approved"
             db.add(goal)
             db.add(GoalApproval(goal_id=goal.id, stage="hr", action="approve", comment=comment.strip(), actor_emp_no=user.emp_no))
@@ -2088,6 +2053,7 @@ def page_goal_approve_hr() -> None:
             if not comment.strip():
                 st.error("差し戻し時はコメントが必須です。")
                 st.stop()
+            goal = attach(db, goal)
             goal.status = "hr_returned"
             db.add(goal)
             db.add(GoalApproval(goal_id=goal.id, stage="hr", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
@@ -2096,13 +2062,18 @@ def page_goal_approve_hr() -> None:
             st.rerun()
 
 
-# ----------------------------
-# Evaluation (Self / Manager / HR) + View
-# ----------------------------
+# ---- Part 3 continues (Evaluation / 1on1 / Dashboard / Export / Router / main) ----
+
+
+# ---- Part 3 ----
+# Evaluation / 1on1 / Approval status / HR dashboard / CSV export / Router / main
+# (All pages use session-fixed year via get_selected_year())
+
 def page_eval_input_self() -> None:
     user = require_role("入力者")
-    section_title("Self Evaluation", "⭐")
     year = get_selected_year()
+    st.subheader("Self Evaluation")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         try:
@@ -2112,7 +2083,7 @@ def page_eval_input_self() -> None:
             return
 
         ev = get_or_create_evaluation(db, user.emp_no, year, goal.id)
-        st.caption(f"年度: {year} / 評価状態: {status_label_eval(ev.status)}")
+        st.caption(f"評価状態: {status_label_eval(ev.status)}")
         if not can_edit_eval_self(ev.status):
             st.info("この評価は編集できない状態です。")
             return
@@ -2120,30 +2091,36 @@ def page_eval_input_self() -> None:
         items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
         biz = [it for it in items if it.type == "business"]
 
-        st.subheader("what（business goal 達成度）")
+        st.markdown("### what（business goal 達成度）")
         st.caption("各business goalの達成率を入力してください（0〜200%）。")
+        state_key = f"es:biz:{user.emp_no}:{year}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = [{"id": it.id, "達成率%(0-200)": it.achieved_percent or 0} for it in biz]
+
         editor_rows = []
         for it in biz:
             editor_rows.append(
                 {
-                    "目標": it.specific[:40] + ("…" if len(it.specific) > 40 else ""),
+                    "目標ID": it.id,
                     "Weight": it.weight or 0,
-                    "達成率%(0-200)": int(it.achieved_percent or 0),
+                    "対象業務": (it.specific or "")[:50] + ("…" if it.specific and len(it.specific) > 50 else ""),
+                    "達成率%(0-200)": next((r["達成率%(0-200)"] for r in st.session_state[state_key] if r["id"] == it.id), it.achieved_percent or 0),
                 }
             )
         updated = st.data_editor(editor_rows, num_rows="fixed", use_container_width=True)
 
-        # apply
-        for it, row in zip(biz, updated):
-            it.achieved_percent = int(row["達成率%(0-200)"])
-            db.add(it)
-        db.flush()
+        tmp = [{"id": int(r["目標ID"]), "達成率%(0-200)": int(r["達成率%(0-200)"])} for r in updated]
+        st.session_state[state_key] = tmp
+
+        for it in biz:
+            newp = next((r["達成率%(0-200)"] for r in tmp if r["id"] == it.id), it.achieved_percent or 0)
+            it.achieved_percent = int(newp)
 
         pct, what = calc_what_from_business(biz)
         st.info(f"what（自己）プレビュー: {what}（加重平均 {pct:.1f}%）")
 
         st.markdown("---")
-        st.subheader("how（8カテゴリ×5問 / 1〜4点）")
+        st.markdown("### how（8カテゴリ×5問 / 1〜4点）")
         questions = db.execute(select(HowQuestion).where(HowQuestion.active.is_(True))).scalars().all()
         qmap: Dict[str, List[HowQuestion]] = {}
         for q in questions:
@@ -2160,14 +2137,20 @@ def page_eval_input_self() -> None:
             for q in qmap.get(cat_key, []):
                 key = f"es_ans:{ev.id}:{cat_key}:{q.question_no}"
                 default = int(existing_map.get((cat_key, q.question_no), 3))
-                val = st.radio(q.question_text, options=[1, 2, 3, 4], index=[1, 2, 3, 4].index(default), horizontal=True, key=key)
+                val = st.radio(
+                    q.question_text,
+                    options=[1, 2, 3, 4],
+                    index=[1, 2, 3, 4].index(default),
+                    horizontal=True,
+                    key=key,
+                )
                 scores.append(int(val))
 
         total, ratio, how = calc_how_from_scores(scores)
         st.info(f"how（自己）プレビュー: {how}（得点 {total}/160, 得点率 {ratio*100:.1f}%）")
 
         st.markdown("---")
-        comment = st.text_area("自己コメント", value=ev.self_comment or "")
+        comment = st.text_area("自己コメント", value=ev.self_comment or "", key=f"es_comment:{ev.id}")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -2176,15 +2159,21 @@ def page_eval_input_self() -> None:
             submit = st.button("自己評価を提出（上長へ）", use_container_width=True)
 
         if save or submit:
-            for it in biz:
-                if (it.achieved_percent or 0) < 0 or (it.achieved_percent or 0) > 200:
+            for r in tmp:
+                if r["達成率%(0-200)"] < 0 or r["達成率%(0-200)"] > 200:
                     st.error("達成率%は0〜200です。")
                     st.stop()
 
-            # replace self answers
+            for it in biz:
+                newp = next((r["達成率%(0-200)"] for r in tmp if r["id"] == it.id), it.achieved_percent or 0)
+                it.achieved_percent = int(newp)
+                db.add(it)
+            db.flush()
+
             for a in db.execute(select(HowAnswer).where(HowAnswer.evaluation_id == ev.id, HowAnswer.rater == "self")).scalars().all():
                 db.delete(a)
             db.flush()
+
             for cat_key, _ in HOW_CATEGORIES:
                 for q in qmap.get(cat_key, []):
                     sc = int(st.session_state[f"es_ans:{ev.id}:{cat_key}:{q.question_no}"])
@@ -2198,39 +2187,52 @@ def page_eval_input_self() -> None:
             ev.self_comment = comment.strip()
             ev.status = "draft" if save else "submitted_self"
             db.add(ev)
-            db.add(EvaluationApproval(evaluation_id=ev.id, stage="self", action="save" if save else "submit", comment="", actor_emp_no=user.emp_no))
+            db.add(
+                EvaluationApproval(
+                    evaluation_id=ev.id,
+                    stage="self",
+                    action="save" if save else "submit",
+                    comment="",
+                    actor_emp_no=user.emp_no,
+                )
+            )
             db.commit()
-
             st.success("保存しました。" if save else "提出しました（上長評価待ち）。")
 
             if submit:
                 emp = db.execute(select(Employee).where(Employee.emp_no == user.emp_no)).scalar_one_or_none()
+                emp_email = emp.email if emp else None
                 manager = db.execute(select(Employee).where(Employee.emp_no == emp.manager_emp_no)).scalar_one_or_none() if emp else None
-                if emp and emp.email:
+                manager_email = manager.email if manager else None
+
+                if emp_email:
                     send_email(
-                        emp.email,
+                        emp_email,
                         f"【評価】自己評価を提出しました（{year}年度）",
                         f"こんにちは {user.name}さん,\n\nあなたが自己評価を提出しました。\n上長による評価をお待ちしています。\n\n---\n本メールは自動送信されています。",
                     )
-                if manager and manager.email:
+                if manager_email:
                     send_email(
-                        manager.email,
+                        manager_email,
                         f"【評価】{user.name}さんが自己評価を提出しました（{year}年度）",
                         f"こんにちは,\n\n{user.name}さんが{year}年度の自己評価を提出しました。\n評価をお願いいたします。\n\n---\n本メールは自動送信されています。",
                     )
+
             st.rerun()
 
 
 def page_eval_input_manager() -> None:
     user = require_role("評価者")
-    section_title("Evaluate Team Members", "⭐")
     year = get_selected_year()
+    st.subheader("Evaluate Team Members")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         subs = db.execute(select(Employee).where(Employee.manager_emp_no == user.emp_no, Employee.active.is_(True))).scalars().all()
         if not subs:
             st.info("部下がいません。")
             return
+
         sub_options = {f"{e.emp_no} {e.name}": e.emp_no for e in subs}
         target_label = st.selectbox("部下を選択", list(sub_options.keys()))
         emp_no = sub_options[target_label]
@@ -2251,8 +2253,8 @@ def page_eval_input_manager() -> None:
         items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
         biz = [it for it in items if it.type == "business"]
 
-        st.caption(f"年度: {year} / 評価状態: {status_label_eval(ev.status)}")
-        st.subheader("what（達成度合い）")
+        st.caption(f"評価状態: {status_label_eval(ev.status)}")
+        st.markdown("### what（達成度合い）")
         pct, what_auto = calc_what_from_business(biz)
         st.info(f"加重平均（達成率）: {pct:.1f}% / 自動判定: {what_auto}")
 
@@ -2263,7 +2265,7 @@ def page_eval_input_manager() -> None:
         )
 
         st.markdown("---")
-        st.subheader("how（上長評価）")
+        st.markdown("### how（上長評価）")
         questions = db.execute(select(HowQuestion).where(HowQuestion.active.is_(True))).scalars().all()
         qmap: Dict[str, List[HowQuestion]] = {}
         for q in questions:
@@ -2280,14 +2282,20 @@ def page_eval_input_manager() -> None:
             for q in qmap.get(cat_key, []):
                 key = f"em_ans:{ev.id}:{cat_key}:{q.question_no}"
                 default = int(existing_map.get((cat_key, q.question_no), 3))
-                val = st.radio(q.question_text, options=[1, 2, 3, 4], index=[1, 2, 3, 4].index(default), horizontal=True, key=key)
+                val = st.radio(
+                    q.question_text,
+                    options=[1, 2, 3, 4],
+                    index=[1, 2, 3, 4].index(default),
+                    horizontal=True,
+                    key=key,
+                )
                 scores.append(int(val))
 
         total, ratio, how_mgr = calc_how_from_scores(scores)
         st.info(f"how（上長）プレビュー: {how_mgr}（得点 {total}/160, 得点率 {ratio*100:.1f}%）")
 
         st.markdown("---")
-        comment = st.text_area("上長コメント（差し戻し時は必須）", value=ev.manager_comment or "")
+        comment = st.text_area("上長コメント（差し戻し時は必須）", value=ev.manager_comment or "", key=f"em_comment:{ev.id}")
         c1, c2, c3 = st.columns(3)
         with c1:
             save = st.button("保存（下書き）", use_container_width=True)
@@ -2301,10 +2309,10 @@ def page_eval_input_manager() -> None:
                 st.error("差し戻し時はコメントが必須です。")
                 st.stop()
 
-            # replace manager answers
             for a in db.execute(select(HowAnswer).where(HowAnswer.evaluation_id == ev.id, HowAnswer.rater == "manager")).scalars().all():
                 db.delete(a)
             db.flush()
+
             for cat_key, _ in HOW_CATEGORIES:
                 for q in qmap.get(cat_key, []):
                     sc = int(st.session_state[f"em_ans:{ev.id}:{cat_key}:{q.question_no}"])
@@ -2326,31 +2334,36 @@ def page_eval_input_manager() -> None:
                 act = "return"
 
             db.add(ev)
-            db.add(EvaluationApproval(evaluation_id=ev.id, stage="manager", action=act, comment=comment.strip() if act == "return" else "", actor_emp_no=user.emp_no))
+            db.add(
+                EvaluationApproval(
+                    evaluation_id=ev.id,
+                    stage="manager",
+                    action=act,
+                    comment=comment.strip() if act == "return" else "",
+                    actor_emp_no=user.emp_no,
+                )
+            )
             db.commit()
-
             st.success("保存しました。" if save else ("提出しました（HR確認待ち）。" if submit else "差し戻しました。"))
 
             if submit:
                 emp = db.execute(select(Employee).where(Employee.emp_no == ev.employee_emp_no)).scalar_one_or_none()
-                hr_admins = db.execute(select(Employee).where(Employee.role_admin.is_(True))).scalars().all()
-                subject = f"【評価】{emp.name if emp else ''}さんの{ev.year}年度評価が上長提出されました"
-                body = (
-                    "こんにちは,\n\n"
-                    f"{emp.name if emp else ''}さんの{ev.year}年度評価が上長（{user.name}さん）により提出されました。\n"
-                    "HR確認をお願いいたします。\n\n---\n本メールは自動送信されています。"
-                )
-                for hr in hr_admins:
-                    if hr.email:
-                        send_email(hr.email, subject, body)
-
+                hr_admins = db.execute(select(Employee).where(Employee.role_admin == True)).scalars().all()
+                for hr_admin in hr_admins:
+                    if hr_admin.email:
+                        send_email(
+                            hr_admin.email,
+                            f"【評価】{emp.name if emp else ''}さんの{ev.year}年度評価が上長提出されました",
+                            f"こんにちは,\n\n{emp.name if emp else ''}さんの{ev.year}年度評価が上長（{user.name}さん）により提出されました。\nHR確認をお願いいたします。\n\n---\n本メールは自動送信されています。",
+                        )
             st.rerun()
 
 
 def page_eval_approve_hr() -> None:
     user = require_role("HR管理者")
-    section_title("Confirm Evaluations (HR)", "✔️")
     year = get_selected_year()
+    st.subheader("Confirm Evaluations (HR)")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         candidates = db.execute(
@@ -2374,7 +2387,6 @@ def page_eval_approve_hr() -> None:
         biz = [it for it in items if it.type == "business"]
 
         pct, what_auto = calc_what_from_business(biz)
-        st.caption(f"年度: {year} / 状態: {status_label_eval(ev.status)}")
         st.write(f"what: self={ev.what_self} / manager={ev.what_manager} / auto={what_auto}（{pct:.1f}%）")
         st.write(f"how: self={ev.how_self} / manager={ev.how_manager}")
         st.write(f"自己コメント: {ev.self_comment}")
@@ -2386,7 +2398,7 @@ def page_eval_approve_hr() -> None:
         radar_chart(category_averages(self_ans), category_averages(mgr_ans))
 
         st.markdown("---")
-        comment = st.text_area("HRコメント（差し戻し時は必須）", value=ev.hr_comment or "")
+        comment = st.text_area("HRコメント（差し戻し時は必須）", value=ev.hr_comment or "", key=f"eh_comment:{ev.id}")
         c1, c2 = st.columns(2)
         with c1:
             approve = st.button("HR確認（確定/公開）", use_container_width=True)
@@ -2418,6 +2430,7 @@ def page_eval_approve_hr() -> None:
                     f"【評価】{emp.name if emp else ''}さんの{ev.year}年度評価がHR確認されました",
                     f"こんにちは {manager.name}さん,\n\n{emp.name if emp else ''}さんの{ev.year}年度評価がHRにより確認されました。\n最終確定されています。1on1設定をお知らせください。\n\n---\n本メールは自動送信されています。",
                 )
+
             st.rerun()
 
         if ret:
@@ -2435,8 +2448,9 @@ def page_eval_approve_hr() -> None:
 
 def page_eval_view_self() -> None:
     user = require_role("入力者")
-    section_title("My Evaluations", "📋")
     year = get_selected_year()
+    st.subheader("My Evaluations")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         ev = db.execute(select(Evaluation).where(Evaluation.employee_emp_no == user.emp_no, Evaluation.year == year)).scalar_one_or_none()
@@ -2444,7 +2458,7 @@ def page_eval_view_self() -> None:
             st.info("評価がありません。")
             return
 
-        st.caption(f"年度: {year} / 状態: {status_label_eval(ev.status)}")
+        st.caption(f"状態: {status_label_eval(ev.status)}")
         st.write(f"what: self={ev.what_self} / manager={ev.what_manager} / final={ev.what_final}")
         st.write(f"how: self={ev.how_self} / manager={ev.how_manager} / final={ev.how_final}")
         st.write(f"自己コメント: {ev.self_comment}")
@@ -2472,19 +2486,18 @@ def page_eval_view_self() -> None:
         st.dataframe(rows, use_container_width=True)
 
 
-# ----------------------------
-# 1on1 (Manager / Employee)
-# ----------------------------
 def page_oneonone_manager() -> None:
     user = require_role("評価者")
-    section_title("Schedule 1:1 Meeting", "📅")
     year = get_selected_year()
+    st.subheader("Schedule 1:1 Meeting")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         subs = db.execute(select(Employee).where(Employee.manager_emp_no == user.emp_no, Employee.active.is_(True))).scalars().all()
         if not subs:
             st.info("部下がいません。")
             return
+
         sub_options = {f"{e.emp_no} {e.name}": e.emp_no for e in subs}
         target_label = st.selectbox("部下を選択", list(sub_options.keys()))
         emp_no = sub_options[target_label]
@@ -2501,15 +2514,15 @@ def page_oneonone_manager() -> None:
             db.commit()
             db.refresh(o1)
 
-        st.caption(f"年度: {year} / 1on1状態: {o1.status}")
+        st.caption(f"1on1状態: {o1.status}")
 
-        slot1_d = st.date_input("候補1（日付）", value=date.today(), key=f"o1_slot1_d:{o1.id}")
+        slot1_d = st.date_input("候補1（日付）", value=datetime.utcnow().date(), key=f"o1_slot1_d:{o1.id}")
         slot1_t = st.time_input("候補1（時刻）", value=datetime.utcnow().time().replace(second=0, microsecond=0), key=f"o1_slot1_t:{o1.id}")
 
-        slot2_d = st.date_input("候補2（日付）", value=date.today(), key=f"o1_slot2_d:{o1.id}")
+        slot2_d = st.date_input("候補2（日付）", value=datetime.utcnow().date(), key=f"o1_slot2_d:{o1.id}")
         slot2_t = st.time_input("候補2（時刻）", value=datetime.utcnow().time().replace(second=0, microsecond=0), key=f"o1_slot2_t:{o1.id}")
 
-        slot3_d = st.date_input("候補3（日付）", value=date.today(), key=f"o1_slot3_d:{o1.id}")
+        slot3_d = st.date_input("候補3（日付）", value=datetime.utcnow().date(), key=f"o1_slot3_d:{o1.id}")
         slot3_t = st.time_input("候補3（時刻）", value=datetime.utcnow().time().replace(second=0, microsecond=0), key=f"o1_slot3_t:{o1.id}")
 
         location = st.text_input("場所/オンラインURL", value=o1.location or "", key=f"o1_loc:{o1.id}")
@@ -2534,18 +2547,22 @@ def page_oneonone_manager() -> None:
             st.success("保存しました。" if save else "提案しました（社員が承認します）。")
 
             if propose:
-                emp = db.execute(select(Employee).where(Employee.emp_no == emp_no)).scalar_one_or_none()
+                emp = db.execute(select(Employee).where(Employee.emp_no == o1.evaluation.employee_emp_no)).scalar_one_or_none()
                 manager = db.execute(select(Employee).where(Employee.emp_no == user.emp_no)).scalar_one_or_none()
 
                 if emp and emp.email:
                     send_email(
                         emp.email,
                         f"【1on1】{user.name}さんが面談日時を提案しました",
-                        f"こんにちは {emp.name}さん,\n\n{user.name}さんが1on1面談の日時候補を提案しました。\n確認して選択してください。\n\n"
-                        f"- 候補1: {o1.slot1.strftime('%Y-%m-%d %H:%M') if o1.slot1 else 'N/A'}\n"
-                        f"- 候補2: {o1.slot2.strftime('%Y-%m-%d %H:%M') if o1.slot2 else 'N/A'}\n"
-                        f"- 候補3: {o1.slot3.strftime('%Y-%m-%d %H:%M') if o1.slot3 else 'N/A'}\n\n---\n本メールは自動送信されています。",
+                        "こんにちは {name}さん,\n\n{mgr}さんが1on1面談の日時候補を提案しました。\n確認して選択してください。\n\n候補日時：\n- 候補1: {s1}\n- 候補2: {s2}\n- 候補3: {s3}\n\n---\n本メールは自動送信されています。".format(
+                            name=emp.name,
+                            mgr=user.name,
+                            s1=o1.slot1.strftime("%Y-%m-%d %H:%M") if o1.slot1 else "N/A",
+                            s2=o1.slot2.strftime("%Y-%m-%d %H:%M") if o1.slot2 else "N/A",
+                            s3=o1.slot3.strftime("%Y-%m-%d %H:%M") if o1.slot3 else "N/A",
+                        ),
                     )
+
                 if manager and manager.email:
                     send_email(
                         manager.email,
@@ -2554,11 +2571,20 @@ def page_oneonone_manager() -> None:
                     )
             st.rerun()
 
+        st.markdown("---")
+        if o1.status == "confirmed":
+            st.success(f"確定: 候補{o1.selected_slot} が選択されました。")
+        elif o1.status == "proposed":
+            st.info("社員の承認待ちです。")
+        else:
+            st.info("下書き状態です。")
+
 
 def page_oneonone_employee() -> None:
     user = require_role("入力者")
-    section_title("1:1 Review (Employee)", "🗣️")
     year = get_selected_year()
+    st.subheader("1:1 Review (Employee)")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         ev = db.execute(select(Evaluation).where(Evaluation.employee_emp_no == user.emp_no, Evaluation.year == year)).scalar_one_or_none()
@@ -2571,11 +2597,11 @@ def page_oneonone_employee() -> None:
             st.info("1on1提案がありません。")
             return
 
-        st.caption(f"年度: {year} / 状態: {o1.status}")
+        st.caption(f"状態: {o1.status}")
         st.write(f"場所/URL: {o1.location}")
         st.write(f"メモ: {o1.note}")
 
-        slots: List[Tuple[int, datetime]] = []
+        slots = []
         if o1.slot1:
             slots.append((1, o1.slot1))
         if o1.slot2:
@@ -2588,8 +2614,9 @@ def page_oneonone_employee() -> None:
             st.success(f"確定日時: {chosen.strftime('%Y-%m-%d %H:%M') if chosen else ''}")
             return
 
+        st.markdown("### 候補から選択して承認してください")
         options = {f"候補{n}: {d.strftime('%Y-%m-%d %H:%M')}": n for n, d in slots}
-        pick_label = st.selectbox("候補から選択", list(options.keys()))
+        pick_label = st.selectbox("選択", list(options.keys()))
         pick = options[pick_label]
         confirm = st.button("この日時で承認（確定）", use_container_width=True)
 
@@ -2608,65 +2635,51 @@ def page_oneonone_employee() -> None:
                 send_email(
                     emp.email,
                     "【1on1】面談日時が確定しました",
-                    f"こんにちは {user.name}さん,\n\n1on1面談の日時が確定しました。\n\n"
-                    f"日時: {chosen_date.strftime('%Y-%m-%d %H:%M') if chosen_date else 'N/A'}\n"
-                    f"場所/URL: {o1.location}\n\n---\n本メールは自動送信されています。",
+                    f"こんにちは {user.name}さん,\n\n1on1面談の日時が確定しました。\n\n日時: {chosen_date.strftime('%Y-%m-%d %H:%M') if chosen_date else 'N/A'}\n場所/URL: {o1.location}\n\n---\n本メールは自動送信されています。",
                 )
             if manager and manager.email:
                 send_email(
                     manager.email,
                     f"【1on1】{emp.name if emp else ''}さんとの面談日時が確定しました",
-                    f"こんにちは {manager.name}さん,\n\n{emp.name if emp else ''}さんとの1on1面談の日時が確定しました。\n\n"
-                    f"日時: {chosen_date.strftime('%Y-%m-%d %H:%M') if chosen_date else 'N/A'}\n"
-                    f"場所/URL: {o1.location}\n\n---\n本メールは自動送信されています。",
+                    f"こんにちは {manager.name}さん,\n\n{emp.name if emp else ''}さんとの1on1面談の日時が確定しました。\n\n日時: {chosen_date.strftime('%Y-%m-%d %H:%M') if chosen_date else 'N/A'}\n場所/URL: {o1.location}\n\n---\n本メールは自動送信されています。",
                 )
             st.rerun()
 
 
-# ----------------------------
-# Approval status (Employee)
-# ----------------------------
 def page_approval_status_self() -> None:
     user = require_role("入力者")
-    section_title("Approval Status", "📊")
     year = get_selected_year()
+    st.subheader("Approval Status")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         goal = db.execute(select(Goal).where(Goal.employee_emp_no == user.emp_no, Goal.year == year)).scalar_one_or_none()
         ev = db.execute(select(Evaluation).where(Evaluation.employee_emp_no == user.emp_no, Evaluation.year == year)).scalar_one_or_none()
 
-        st.subheader("目標")
+        st.markdown("### 目標")
         if not goal:
             st.write("未作成")
         else:
             st.write(f"状態: {status_label_goal(goal.status)}")
             approvals = db.execute(select(GoalApproval).where(GoalApproval.goal_id == goal.id).order_by(GoalApproval.acted_at.asc())).scalars().all()
-            rows = [
-                {"日時": a.acted_at.strftime("%Y-%m-%d %H:%M"), "ステージ": a.stage, "アクション": a.action, "コメント": (a.comment or "").strip()}
-                for a in approvals
-            ]
+            rows = [{"日時": a.acted_at.strftime("%Y-%m-%d %H:%M"), "ステージ": a.stage, "アクション": a.action, "コメント": (a.comment or "").strip()} for a in approvals]
             st.dataframe(rows, use_container_width=True)
 
-        st.subheader("評価")
+        st.markdown("### 評価")
         if not ev:
             st.write("未開始")
         else:
             st.write(f"状態: {status_label_eval(ev.status)}")
             approvals = db.execute(select(EvaluationApproval).where(EvaluationApproval.evaluation_id == ev.id).order_by(EvaluationApproval.acted_at.asc())).scalars().all()
-            rows = [
-                {"日時": a.acted_at.strftime("%Y-%m-%d %H:%M"), "ステージ": a.stage, "アクション": a.action, "コメント": (a.comment or "").strip()}
-                for a in approvals
-            ]
+            rows = [{"日時": a.acted_at.strftime("%Y-%m-%d %H:%M"), "ステージ": a.stage, "アクション": a.action, "コメント": (a.comment or "").strip()} for a in approvals]
             st.dataframe(rows, use_container_width=True)
 
 
-# ----------------------------
-# HR Dashboard
-# ----------------------------
 def page_hr_dashboard() -> None:
     require_role("HR管理者")
-    section_title("HR Dashboard", "📈")
     year = get_selected_year()
+    st.subheader("HR Dashboard")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         employees = db.execute(select(Employee).where(Employee.active.is_(True))).scalars().all()
@@ -2692,10 +2705,10 @@ def page_hr_dashboard() -> None:
 
         goals = db.execute(select(Goal).where(Goal.year == year)).scalars().all()
         evals = db.execute(select(Evaluation).where(Evaluation.year == year)).scalars().all()
+
         goals_f = [g for g in goals if g.employee_emp_no in filtered_emp_nos]
         evals_f = [e for e in evals if e.employee_emp_no in filtered_emp_nos]
 
-        st.markdown("### 対象人数")
         st.metric("入力者（対象）", value=str(len(filtered_emps)))
 
         goal_counts = {k: 0 for k in GOAL_STATUSES.keys()}
@@ -2709,12 +2722,10 @@ def page_hr_dashboard() -> None:
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### 目標 進捗（件数）")
-            rows = [{"status": GOAL_STATUSES[k], "count": goal_counts.get(k, 0)} for k in GOAL_STATUSES.keys()]
-            st.dataframe(rows, use_container_width=True)
+            st.dataframe([{"status": GOAL_STATUSES[k], "count": goal_counts.get(k, 0)} for k in GOAL_STATUSES.keys()], use_container_width=True)
         with c2:
             st.markdown("### 評価 進捗（件数）")
-            rows = [{"status": EVAL_STATUSES[k], "count": eval_counts.get(k, 0)} for k in EVAL_STATUSES.keys()]
-            st.dataframe(rows, use_container_width=True)
+            st.dataframe([{"status": EVAL_STATUSES[k], "count": eval_counts.get(k, 0)} for k in EVAL_STATUSES.keys()], use_container_width=True)
 
         def ratio(n: int, d: int) -> float:
             return (n / d * 100.0) if d else 0.0
@@ -2741,9 +2752,9 @@ def page_hr_dashboard() -> None:
 
         st.markdown("---")
         st.markdown("### 一覧（フィルタ結果）")
-        rows = []
         goal_map = {g.employee_emp_no: g for g in goals_f}
         eval_map = {e.employee_emp_no: e for e in evals_f}
+        rows = []
         for emp in sorted(filtered_emps, key=lambda x: x.emp_no):
             g = goal_map.get(emp.emp_no)
             e = eval_map.get(emp.emp_no)
@@ -2760,13 +2771,11 @@ def page_hr_dashboard() -> None:
         st.dataframe(rows, use_container_width=True)
 
 
-# ----------------------------
-# Admin CSV Export
-# ----------------------------
 def page_admin_csv() -> None:
     require_role("HR管理者")
-    section_title("Export CSV", "📥")
     year = get_selected_year()
+    st.subheader("Export CSV")
+    st.caption(f"年度: {year}")
 
     with SessionLocal() as db:
         st.markdown("### 目標CSV（上長提出時点でDL可）")
@@ -2791,7 +2800,6 @@ def page_admin_csv() -> None:
                         "achievable": it.achievable,
                         "relevant": it.relevant,
                         "time_bound": it.time_bound,
-                        "career_vision": it.career_vision or "",
                         "weight": it.weight if it.type == "business" else "",
                         "achieved_percent": it.achieved_percent if it.type == "business" else "",
                         "updated_at": g.updated_at.isoformat(),
@@ -2829,15 +2837,11 @@ def page_admin_csv() -> None:
         st.download_button("evaluations.csv をダウンロード", data=to_csv(rows2).encode("utf-8"), file_name="evaluations.csv", mime="text/csv")
 
 
-# ----------------------------
-# Router
-# ----------------------------
 PAGES: Dict[str, Callable[[], None]] = {
     "login": page_login,
     "forgot_password": page_forgot_password,
     "password_change": page_password_change,
     "home": page_home,
-
     # employee
     "goal_input": page_goal_input,
     "goal_view_self": page_goal_view_self,
@@ -2845,13 +2849,11 @@ PAGES: Dict[str, Callable[[], None]] = {
     "eval_view_self": page_eval_view_self,
     "oneonone_employee": page_oneonone_employee,
     "approval_status_self": page_approval_status_self,
-
     # manager
     "goal_view_manager": page_goal_view_manager,
     "goal_approve_manager": page_goal_approve_manager,
     "eval_input_manager": page_eval_input_manager,
     "oneonone_manager": page_oneonone_manager,
-
     # admin
     "hr_dashboard": page_hr_dashboard,
     "admin_employee_master": page_admin_employee_master,
@@ -2883,5 +2885,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
