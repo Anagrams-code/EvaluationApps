@@ -1,51 +1,10 @@
-# FILE: app.py
-"""
-All-in-one Streamlit App: Goal -> Approval -> Evaluation -> 1on1 -> CSV
-Streamlit Community Cloud + PostgreSQL/SQLite
-
-Fixes / features (integrated, stable single file):
-- 年度をログイン画面で指定（4桁数値）しセッション固定（全ページ共通）
-- ログイン画面: 権限プルダウン順「入力者→評価者→HR管理者」、デフォルト「入力者」
-- SQLite既存DBのスキーマ差分を軽量マイグレーションで吸収
-  - employees.email / employees.manager_email
-  - goal_items.deadline_date / goal_items.time_bound（NULL補正含む）
-- 初期管理者（000001, 425025）の初期PWは ChangeMe_1234（Secrets未設定でも）
-- 従業員マスタCSV:
-  - email列
-  - password空欄なら ChangeMe_1234 を自動セット（次回ログイン時変更必須）
-  - 文字コード decode を utf-8-sig / cp932 / utf-8(replace) でフォールバック
-- SMART理論の説明をサイドバーに表示
-- 目標入力UI刷新（新ラベル）
-  - business goal: 「対象業務」「達成したい結果」「期限(日付)」「部署ゴールとの関連性」「実行計画(任意)」
-    - 最大5件、最低1件必須（入力行は①必須）
-  - development goal:
-    「なりたい人物像/身につけたいスキル」「現在の自分とのギャップ」「どのような行動を行いますか？」
-    +「実行計画(任意)」「完了時期(任意: 日付)」
-    - 最大2件、最低1件必須（入力行は①必須）
-- Weight廃止（what判定は achieved_percent の等ウェイト平均）
-- 目標 差戻し→再Submit で起きる Session InvalidRequestError を避ける（再取得して処理）
-- SMTP未設定でも落ちない（send_emailは False でスキップ、debugを session に保存）
-
-Run:
-pip install -r requirements.txt
-streamlit run app.py
-
-Secrets (Streamlit Cloud):
-DATABASE_URL="postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME"
-ADMIN_SEED_PASSWORD="ChangeMe_1234"
-SMTP_SERVER="..."
-SMTP_PORT="587"
-SMTP_USERNAME="..."
-SMTP_PASSWORD="..."
-SMTP_FROM_EMAIL="..."
-"""
-
+# app.py (Part 1/4)
 from __future__ import annotations
 
 import csv
 import os
 import smtplib
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -70,9 +29,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
-# ----------------------------
-# Constants & Branding
-# ----------------------------
+
+# =============================================================================
+# App meta / constants
+# =============================================================================
 APP_TITLE = "Goal Management System - Stanley Black & Decker"
 
 BRAND_COLORS = {
@@ -87,8 +47,11 @@ BRAND_COLORS = {
     "info": "#17a2b8",
 }
 
-# bcrypt が無くても動くよう pbkdf2_sha256 を先頭に
-PWD_CONTEXT = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], default="pbkdf2_sha256", deprecated="auto")
+PWD_CONTEXT = CryptContext(
+    schemes=["pbkdf2_sha256", "bcrypt"],
+    default="pbkdf2_sha256",
+    deprecated="auto",
+)
 
 Role = Literal["HR管理者", "評価者", "入力者"]
 ROLE_TO_FLAG: Dict[str, str] = {"HR管理者": "role_admin", "評価者": "role_manager", "入力者": "role_employee"}
@@ -112,10 +75,8 @@ EVAL_STATUSES = {
     "hr_approved": "公開（確定）",
 }
 
-# what判定（等ウェイト平均%）
 WHAT_THRESHOLDS = {"exceeds": 130.0, "meets": 95.0}
 
-# how判定（満点160=40問×4点）
 HOW_TOTAL_MAX = 160
 HOW_EXCEEDS_RATIO = 0.9
 HOW_MEETS_RATIO = 0.6
@@ -139,24 +100,53 @@ SMART_SIDEBAR_TEXT = """
 
 **SMART** は「良い目標」を作るためのフレームワークです。
 
-- **S（Specific）具体的に**  
+- **S（Specific）具体的に**
   対象業務が何か、誰に何を提供するかを明確にします。
-- **M（Measurable）測定可能に**  
+- **M（Measurable）測定可能に**
   期限までに「何がどうなっていれば達成か」を数字や状態で表します。
-- **A（Achievable）実行可能に**  
+- **A（Achievable）実行可能に**
   実行計画（やること・進め方）が現実的かを確認します（本アプリでは任意項目です）。
-- **R（Relevant）関連性**  
+- **R（Relevant）関連性**
   部署ゴールや組織の方向性と、どうつながるかを言語化します。
-- **T（Time-bound）期限**  
+- **T（Time-bound）期限**
   期日（いつまでに）を明確にします（本アプリでは日付入力）。
 
-迷ったら：  
+---
+
+## ✅ 良い例 / ❌ 悪い例
+
+### business goal（例）
+**❌ 悪い例**
+- 「売上を伸ばす」
+  - 何を／誰に／どれくらい／いつまでが不明
+
+**✅ 良い例**
+- 「既存顧客（A社・B社）の追加受注を獲得し、2026-06-30までに売上 +10%（前年差）を達成する。
+  施策：提案資料テンプレ統一、月2回の定例レビュー、失注理由の分類と改善。」
+
+---
+
+### development goal（例）
+**❌ 悪い例**
+- 「英語を頑張る」
+  - 行動、達成条件、期限が曖昧
+
+**✅ 良い例**
+- 「海外拠点との会議で自走できるよう、2026-09-30までに
+  ①週3回（各30分）のリスニング練習、
+  ②月2回の英会話（業務ロールプレイ）、
+  ③会議議事録を英語で作成し上長レビューを受ける（毎月1回）を継続する。」
+
+---
+
+迷ったら：
 「対象業務 → 結果（成果） → 期限 → 部署ゴールとの関係 → 実行計画」の順に書くとスムーズです。
 """
 
-# ----------------------------
+
+# =============================================================================
 # Secrets / Config
-# ----------------------------
+# =============================================================================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     try:
         if key in st.secrets:
@@ -168,18 +158,16 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
 
 def database_url() -> str:
     url = get_secret("DATABASE_URL")
-    if not url:
-        return "sqlite:///./data/app.db"
-    return url
+    return url if url else "sqlite:///./data/app.db"
 
 
 def admin_seed_password() -> str:
     return get_secret("ADMIN_SEED_PASSWORD", "ChangeMe_1234") or "ChangeMe_1234"
 
 
-# ----------------------------
-# Year handling
-# ----------------------------
+# =============================================================================
+# Year handling (login -> fixed)
+# =============================================================================
 def set_selected_year(year: int, *, force: bool = False) -> None:
     if not force and st.session_state.get("auth_user") and st.session_state.get("selected_year") is not None:
         return
@@ -211,9 +199,9 @@ def year_input_login(default_year: int) -> int:
     )
 
 
-# ----------------------------
+# =============================================================================
 # CSV decode helper
-# ----------------------------
+# =============================================================================
 def decode_bytes_fallback(raw: bytes) -> str:
     for enc in ("utf-8-sig", "cp932"):
         try:
@@ -223,9 +211,9 @@ def decode_bytes_fallback(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-# ----------------------------
-# Email Support
-# ----------------------------
+# =============================================================================
+# Email Support (SMTP未設定でも落とさない)
+# =============================================================================
 def send_email(to_email: Optional[str], subject: str, body: str) -> bool:
     if not to_email or not to_email.strip():
         return False
@@ -237,7 +225,6 @@ def send_email(to_email: Optional[str], subject: str, body: str) -> bool:
         smtp_pass = get_secret("SMTP_PASSWORD")
         from_email = get_secret("SMTP_FROM_EMAIL", smtp_user)
 
-        # SMTP設定が無ければスキップ（落とさない）
         if not smtp_user or not smtp_pass:
             st.session_state["email_debug"] = f"[Email Skipped]\nTo: {to_email}\nSubject: {subject}\n{body}"
             return False
@@ -267,9 +254,9 @@ def send_email(to_email: Optional[str], subject: str, body: str) -> bool:
         return False
 
 
-# ----------------------------
+# =============================================================================
 # DB Models
-# ----------------------------
+# =============================================================================
 class Base(DeclarativeBase):
     pass
 
@@ -327,32 +314,16 @@ class GoalItem(Base):
 
     type: Mapped[str] = mapped_column(String(16), nullable=False)  # business/development
 
-    # business:
-    #   specific = 対象業務
-    #   measurable = 達成したい結果
-    #   relevant = 部署ゴールとの関連性
-    #   achievable = 実行計画(任意)
-    #   deadline_date = 期限(日付)
-    #
-    # development:
-    #   career_vision = なりたい人物像/身につけたいスキル
-    #   specific = 現在の自分とのギャップ
-    #   measurable = どのような行動を行いますか？
-    #   achievable = 実行計画(任意)
-    #   deadline_date = 完了時期(任意)
-    specific: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    measurable: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    achievable: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    relevant: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    specific: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    measurable: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    achievable: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    relevant: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
-    # 互換維持（使わないが残す）：DB側デフォルトも持たせる
-    time_bound: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    time_bound: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     deadline_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-
     career_vision: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # 互換維持（UIでは使わない）
     weight: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     achieved_percent: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # business only 0..200
 
@@ -406,7 +377,13 @@ class Evaluation(Base):
 
     answers: Mapped[List["HowAnswer"]] = relationship(back_populates="evaluation", cascade="all, delete-orphan")
     approvals: Mapped[List["EvaluationApproval"]] = relationship(back_populates="evaluation", cascade="all, delete-orphan")
-    oneonone: Mapped[Optional["OneOnOne"]] = relationship(back_populates="evaluation", cascade="all, delete-orphan")
+
+    oneonone: Mapped[Optional["OneOnOne"]] = relationship(
+        back_populates="evaluation",
+        cascade="all, delete-orphan",
+        uselist=False,
+        single_parent=True,
+    )
 
 
 class HowQuestion(Base):
@@ -477,9 +454,9 @@ class OneOnOne(Base):
     evaluation: Mapped["Evaluation"] = relationship(back_populates="oneonone")
 
 
-# ----------------------------
+# =============================================================================
 # DB init / migrate
-# ----------------------------
+# =============================================================================
 _data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(_data_dir, exist_ok=True)
 
@@ -496,7 +473,7 @@ def _get_engine():
         )
 
         @event.listens_for(engine, "connect")
-        def set_sqlite_pragma(dbapi_conn, connection_record):
+        def set_sqlite_pragma(dbapi_conn, _connection_record):
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.close()
@@ -524,7 +501,6 @@ def migrate_sqlite_schema_if_needed() -> None:
         return
 
     with ENGINE.begin() as conn:
-        # employees
         if _sqlite_table_exists(conn, "employees"):
             cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(employees)").fetchall()]
             if "email" not in cols:
@@ -532,7 +508,6 @@ def migrate_sqlite_schema_if_needed() -> None:
             if "manager_email" not in cols:
                 conn.exec_driver_sql("ALTER TABLE employees ADD COLUMN manager_email VARCHAR(255)")
 
-        # goal_items
         if _sqlite_table_exists(conn, "goal_items"):
             cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(goal_items)").fetchall()]
             if "deadline_date" not in cols:
@@ -540,19 +515,11 @@ def migrate_sqlite_schema_if_needed() -> None:
             if "time_bound" not in cols:
                 conn.exec_driver_sql("ALTER TABLE goal_items ADD COLUMN time_bound TEXT DEFAULT ''")
 
-            # NULL補正（古いデータでNULLが残っても落ちないように）
             conn.exec_driver_sql("UPDATE goal_items SET specific='' WHERE specific IS NULL")
             conn.exec_driver_sql("UPDATE goal_items SET measurable='' WHERE measurable IS NULL")
             conn.exec_driver_sql("UPDATE goal_items SET achievable='' WHERE achievable IS NULL")
             conn.exec_driver_sql("UPDATE goal_items SET relevant='' WHERE relevant IS NULL")
             conn.exec_driver_sql("UPDATE goal_items SET time_bound='' WHERE time_bound IS NULL")
-
-
-def init_db() -> None:
-    Base.metadata.create_all(ENGINE)
-    migrate_sqlite_schema_if_needed()
-    seed_admin_if_needed()
-    seed_how_questions_if_needed()
 
 
 def seed_admin_if_needed() -> None:
@@ -598,6 +565,7 @@ def seed_admin_if_needed() -> None:
                     last_login_at=None,
                 )
             )
+
         db.commit()
 
 
@@ -680,9 +648,17 @@ def seed_how_questions_if_needed() -> None:
         db.commit()
 
 
-# ----------------------------
+def init_db() -> None:
+    Base.metadata.create_all(ENGINE)
+    migrate_sqlite_schema_if_needed()
+    seed_admin_if_needed()
+    seed_how_questions_if_needed()
+
+# app.py (Part 2/4)
+
+# =============================================================================
 # Auth / Session
-# ----------------------------
+# =============================================================================
 @dataclass(frozen=True)
 class AuthUser:
     emp_no: str
@@ -736,6 +712,7 @@ def require_login() -> AuthUser:
             if emp.must_change_password:
                 set_page("password_change")
                 st.stop()
+
     return user
 
 
@@ -747,9 +724,9 @@ def require_role(*allowed: Role) -> AuthUser:
     return user
 
 
-# ----------------------------
-# Domain logic
-# ----------------------------
+# =============================================================================
+# Core domain utils
+# =============================================================================
 def status_label_goal(status: str) -> str:
     return GOAL_STATUSES.get(status, status)
 
@@ -767,7 +744,7 @@ def can_edit_eval_self(status: str) -> bool:
 
 
 def calc_what_from_business(items: List[GoalItem]) -> Tuple[float, str]:
-    """等ウェイト：business goal の achieved_percent を単純平均。"""
+    """等ウェイト：business goal の achieved_percent の単純平均。"""
     biz = [i for i in items if i.type == "business"]
     if not biz:
         return 0.0, "does_not_meet"
@@ -827,6 +804,7 @@ def radar_chart(self_avg: Dict[str, float], mgr_avg: Dict[str, float]) -> None:
     ax.fill(angles, mgr_vals, alpha=0.15)
     ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.1))
     st.pyplot(fig, clear_figure=True)
+    plt.close(fig)
 
 
 def to_csv(rows: List[Dict[str, Any]]) -> str:
@@ -871,9 +849,9 @@ def _fmt_date(d: Optional[date]) -> str:
     return d.strftime("%Y-%m-%d") if d else ""
 
 
-# ----------------------------
+# =============================================================================
 # UI Helpers
-# ----------------------------
+# =============================================================================
 def apply_custom_styles() -> None:
     st.markdown(
         f"""
@@ -1030,9 +1008,9 @@ def nav_sidebar(user: Optional[AuthUser]) -> None:
                 st.rerun()
 
 
-# ----------------------------
+# =============================================================================
 # Pages: Auth
-# ----------------------------
+# =============================================================================
 def page_login() -> None:
     st.markdown(
         f"""
@@ -1050,7 +1028,6 @@ def page_login() -> None:
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("login_form", clear_on_submit=False):
-            # 要件: 順番「入力者→評価者→HR管理者」、デフォルト「入力者」
             role: Role = st.selectbox("📋 Select Role:", ["入力者", "評価者", "HR管理者"], index=0)
             login_year = year_input_login(datetime.utcnow().year)
             emp_no = st.text_input("👤 Employee ID:", placeholder="Example: 000001")
@@ -1087,8 +1064,7 @@ def page_login() -> None:
         db.commit()
 
         set_selected_year(int(login_year), force=True)
-        auth = AuthUser(emp_no=emp.emp_no, name=emp.name, role=role, role_key=ROLE_TO_KEY[role])
-        set_auth(auth)
+        set_auth(AuthUser(emp_no=emp.emp_no, name=emp.name, role=role, role_key=ROLE_TO_KEY[role]))
 
         if emp.must_change_password:
             set_page("password_change")
@@ -1096,6 +1072,7 @@ def page_login() -> None:
         else:
             set_page("home")
             st.success("✅ Welcome back!")
+
         st.rerun()
 
 
@@ -1156,242 +1133,9 @@ def page_password_change() -> None:
     st.rerun()
 
 
-# ----------------------------
-# Admin: Employee Master
-# ----------------------------
-def _parse_bool(v: Any, default: bool = False) -> bool:
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on", "○"}:
-        return True
-    if s in {"0", "false", "f", "no", "n", "off", "×"}:
-        return False
-    return default
-
-
-def _csv_template_text() -> str:
-    return (
-        "emp_no,name,department,email,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
-        "000002,山田太郎,Sales,taro.yamada@example.com,1,0,0,1,010000,\n"
-        "010000,佐藤花子,Sales,hanako.sato@example.com,1,0,1,0,,\n"
-    )
-
-
-def page_admin_employee_master() -> None:
-    require_role("HR管理者")
-    section_title("Employee Master Management", "👥")
-
-    st.markdown("### CSV Upload")
-    st.caption(
-        "列: emp_no,name,department,email,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
-        "※ password空欄の場合は ChangeMe_1234 を自動セット（次回ログイン時変更は必須）"
-    )
-    st.download_button(
-        "CSVテンプレートをダウンロード",
-        data=_csv_template_text().encode("utf-8"),
-        file_name="employee_master_template.csv",
-        mime="text/csv",
-    )
-
-    up = st.file_uploader("従業員マスタCSVをアップロード", type=["csv"])
-    if up is not None:
-        raw = decode_bytes_fallback(up.getvalue())
-        reader = csv.DictReader(StringIO(raw))
-
-        required_cols = {"emp_no", "name"}
-        missing = [c for c in required_cols if c not in (reader.fieldnames or [])]
-        if missing:
-            st.error(f"必須列が足りません: {missing}")
-        else:
-            updated_count = 0
-            created_count = 0
-            with SessionLocal() as db:
-                for row in reader:
-                    emp_no = str(row.get("emp_no", "")).strip()
-                    name = str(row.get("name", "")).strip()
-                    if not emp_no or not name:
-                        continue
-
-                    department = str(row.get("department", "") or "").strip()
-                    email = str(row.get("email", "") or "").strip() or None
-
-                    active = _parse_bool(row.get("active", "1"), True)
-                    role_admin = _parse_bool(row.get("role_admin", "0"), False)
-                    role_manager = _parse_bool(row.get("role_manager", "0"), False)
-                    role_employee = _parse_bool(row.get("role_employee", "1"), True)
-
-                    manager_emp_no = str(row.get("manager_emp_no", "") or "").strip() or None
-
-                    # 要件: password空欄なら ChangeMe_1234
-                    password = str(row.get("password", "") or "").strip()
-                    if not password:
-                        password = "ChangeMe_1234"
-
-                    existing = db.execute(select(Employee).where(Employee.emp_no == emp_no)).scalar_one_or_none()
-                    if existing:
-                        existing.name = name
-                        existing.department = department
-                        existing.email = email
-                        existing.active = bool(active)
-                        existing.role_admin = bool(role_admin)
-                        existing.role_manager = bool(role_manager)
-                        existing.role_employee = bool(role_employee)
-                        existing.manager_emp_no = manager_emp_no
-
-                        # 要件優先：更新でも常に password を反映（空欄ならChangeMe_1234）
-                        existing.password_hash = PWD_CONTEXT.hash(password)
-                        existing.must_change_password = True
-                        existing.password_updated_at = None
-
-                        db.add(existing)
-                        updated_count += 1
-                    else:
-                        db.add(
-                            Employee(
-                                emp_no=emp_no,
-                                name=name,
-                                department=department,
-                                email=email,
-                                password_hash=PWD_CONTEXT.hash(password),
-                                active=bool(active),
-                                role_admin=bool(role_admin),
-                                role_manager=bool(role_manager),
-                                role_employee=bool(role_employee),
-                                manager_emp_no=manager_emp_no,
-                                manager_email=None,
-                                must_change_password=True,
-                                password_updated_at=None,
-                                last_login_at=None,
-                            )
-                        )
-                        created_count += 1
-
-                db.commit()
-
-            st.success(f"CSV取り込み完了：新規 {created_count} / 更新 {updated_count}")
-
-    st.markdown("---")
-    st.markdown("### Add/Update Manually")
-    with st.form("emp_upsert", clear_on_submit=True):
-        emp_no = st.text_input("従業員番号", placeholder="例: 000002")
-        name = st.text_input("氏名", placeholder="例: 山田 太郎")
-        department = st.text_input("部署", placeholder="例: Sales")
-        email = st.text_input("メールアドレス（任意）", placeholder="例: user@example.com")
-        password = st.text_input("初期/変更パスワード（空なら ChangeMe_1234）", type="password")
-        active = st.checkbox("在籍", value=True)
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            role_admin = st.checkbox("管理者権限")
-        with col2:
-            role_manager = st.checkbox("評価者権限")
-        with col3:
-            role_employee = st.checkbox("入力者権限", value=True)
-
-        manager_emp_no = st.text_input("上長の従業員番号（任意）", placeholder="例: 010000（評価者）")
-        ok = st.form_submit_button("保存")
-
-    if ok:
-        emp_no = emp_no.strip()
-        name = name.strip()
-        if not emp_no or not name:
-            st.error("従業員番号と氏名は必須です。")
-        elif not (role_admin or role_manager or role_employee):
-            st.error("少なくとも1つの権限を付与してください。")
-        else:
-            if not password:
-                password = "ChangeMe_1234"
-
-            with SessionLocal() as db:
-                existing = db.execute(select(Employee).where(Employee.emp_no == emp_no)).scalar_one_or_none()
-                if existing:
-                    existing.name = name
-                    existing.department = department.strip()
-                    existing.email = email.strip() or None
-                    existing.active = bool(active)
-                    existing.role_admin = bool(role_admin)
-                    existing.role_manager = bool(role_manager)
-                    existing.role_employee = bool(role_employee)
-                    existing.manager_emp_no = manager_emp_no.strip() or None
-
-                    existing.password_hash = PWD_CONTEXT.hash(password)
-                    existing.must_change_password = True
-                    existing.password_updated_at = None
-
-                    db.add(existing)
-                    db.commit()
-                    st.success("更新しました（次回ログインでPW変更必須）。")
-                else:
-                    db.add(
-                        Employee(
-                            emp_no=emp_no,
-                            name=name,
-                            department=department.strip(),
-                            email=email.strip() or None,
-                            password_hash=PWD_CONTEXT.hash(password),
-                            active=bool(active),
-                            role_admin=bool(role_admin),
-                            role_manager=bool(role_manager),
-                            role_employee=bool(role_employee),
-                            manager_emp_no=manager_emp_no.strip() or None,
-                            manager_email=None,
-                            must_change_password=True,
-                            password_updated_at=None,
-                            last_login_at=None,
-                        )
-                    )
-                    db.commit()
-                    st.success("追加しました（次回ログインでPW変更必須）。")
-
-    st.markdown("---")
-    st.markdown("### 従業員一覧 / パスワードリセット")
-    with SessionLocal() as db:
-        emps = db.execute(select(Employee).order_by(Employee.emp_no.asc())).scalars().all()
-        if not emps:
-            st.warning("従業員がいません。")
-            return
-
-        options = {f"{e.emp_no} {e.name}（{e.department}）": e.emp_no for e in emps}
-        selected_label = st.selectbox("リセット対象を選択", list(options.keys()))
-        selected_emp_no = options[selected_label]
-
-        colr1, colr2 = st.columns([1, 2])
-        with colr1:
-            do_reset = st.button("ChangeMe_1234 にリセット")
-        with colr2:
-            st.caption("リセット後、ユーザーは次回ログインで必ずPW変更します。")
-
-        if do_reset:
-            emp = db.execute(select(Employee).where(Employee.emp_no == selected_emp_no)).scalar_one()
-            emp.password_hash = PWD_CONTEXT.hash("ChangeMe_1234")
-            emp.must_change_password = True
-            emp.password_updated_at = None
-            db.add(emp)
-            db.commit()
-            st.success("ChangeMe_1234 にリセットしました。")
-
-        rows = [
-            {
-                "emp_no": e.emp_no,
-                "name": e.name,
-                "department": e.department,
-                "email": e.email or "",
-                "active": "○" if e.active else "×",
-                "role_admin": "○" if e.role_admin else "",
-                "role_manager": "○" if e.role_manager else "",
-                "role_employee": "○" if e.role_employee else "",
-                "manager_emp_no": e.manager_emp_no or "",
-                "must_change_pw": "○" if e.must_change_password else "",
-            }
-            for e in emps
-        ]
-        st.dataframe(rows, use_container_width=True)
-
-
-# ----------------------------
+# =============================================================================
 # Pages: Home
-# ----------------------------
+# =============================================================================
 def page_home() -> None:
     user = require_login()
 
@@ -1445,15 +1189,247 @@ def page_home() -> None:
         with c5:
             st.button("✔️ Approve Evaluations (HR)", use_container_width=True, on_click=set_page, args=("eval_approve_hr",))
 
+# app.py (Part 3/4)
 
-# ----------------------------
-# Goals: Input / View
-# ----------------------------
+# =============================================================================
+# Admin: Employee Master
+# =============================================================================
+def _parse_bool(v: Any, default: bool = False) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on", "○"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off", "×"}:
+        return False
+    return default
+
+
+def _csv_template_text() -> str:
+    return (
+        "emp_no,name,department,email,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
+        "000002,山田太郎,Sales,taro.yamada@example.com,1,0,0,1,010000,\n"
+        "010000,佐藤花子,Sales,hanako.sato@example.com,1,0,1,0,,\n"
+    )
+
+
+def page_admin_employee_master() -> None:
+    require_role("HR管理者")
+    section_title("Employee Master Management", "👥")
+
+    st.markdown("### CSV Upload")
+    st.caption(
+        "列: emp_no,name,department,email,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
+        "※ password空欄の場合は ChangeMe_1234 を自動セット（次回ログイン時変更は必須）"
+    )
+
+    st.download_button(
+        "CSVテンプレートをダウンロード",
+        data=_csv_template_text().encode("utf-8"),
+        file_name="employee_master_template.csv",
+        mime="text/csv",
+    )
+
+    up = st.file_uploader("従業員マスタCSVをアップロード", type=["csv"])
+    if up is not None:
+        raw = decode_bytes_fallback(up.getvalue())
+        reader = csv.DictReader(StringIO(raw))
+
+        required_cols = {"emp_no", "name"}
+        missing = [c for c in required_cols if c not in (reader.fieldnames or [])]
+        if missing:
+            st.error(f"必須列が足りません: {missing}")
+        else:
+            updated_count = 0
+            created_count = 0
+            with SessionLocal() as db:
+                for row in reader:
+                    emp_no = str(row.get("emp_no", "")).strip()
+                    name = str(row.get("name", "")).strip()
+                    if not emp_no or not name:
+                        continue
+
+                    department = str(row.get("department", "") or "").strip()
+                    email = str(row.get("email", "") or "").strip() or None
+
+                    active = _parse_bool(row.get("active", "1"), True)
+                    role_admin = _parse_bool(row.get("role_admin", "0"), False)
+                    role_manager = _parse_bool(row.get("role_manager", "0"), False)
+                    role_employee = _parse_bool(row.get("role_employee", "1"), True)  # default inputter
+
+                    manager_emp_no = str(row.get("manager_emp_no", "") or "").strip() or None
+
+                    password = str(row.get("password", "") or "").strip() or "ChangeMe_1234"
+
+                    existing = db.execute(select(Employee).where(Employee.emp_no == emp_no)).scalar_one_or_none()
+                    if existing:
+                        existing.name = name
+                        existing.department = department
+                        existing.email = email
+                        existing.active = bool(active)
+                        existing.role_admin = bool(role_admin)
+                        existing.role_manager = bool(role_manager)
+                        existing.role_employee = bool(role_employee)
+                        existing.manager_emp_no = manager_emp_no
+
+                        existing.password_hash = PWD_CONTEXT.hash(password)
+                        existing.must_change_password = True
+                        existing.password_updated_at = None
+
+                        db.add(existing)
+                        updated_count += 1
+                    else:
+                        db.add(
+                            Employee(
+                                emp_no=emp_no,
+                                name=name,
+                                department=department,
+                                email=email,
+                                password_hash=PWD_CONTEXT.hash(password),
+                                active=bool(active),
+                                role_admin=bool(role_admin),
+                                role_manager=bool(role_manager),
+                                role_employee=bool(role_employee),
+                                manager_emp_no=manager_emp_no,
+                                manager_email=None,
+                                must_change_password=True,
+                                password_updated_at=None,
+                                last_login_at=None,
+                            )
+                        )
+                        created_count += 1
+
+                db.commit()
+
+            st.success(f"CSV取り込み完了：新規 {created_count} / 更新 {updated_count}")
+
+    st.markdown("---")
+    st.markdown("### Add/Update Manually")
+
+    with st.form("emp_upsert", clear_on_submit=True):
+        emp_no = st.text_input("従業員番号", placeholder="例: 000002")
+        name = st.text_input("氏名", placeholder="例: 山田 太郎")
+        department = st.text_input("部署", placeholder="例: Sales")
+        email = st.text_input("メールアドレス（任意）", placeholder="例: user@example.com")
+        password = st.text_input("初期/変更パスワード（空なら ChangeMe_1234）", type="password")
+        active = st.checkbox("在籍", value=True)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            role_admin = st.checkbox("管理者権限")
+        with col2:
+            role_manager = st.checkbox("評価者権限")
+        with col3:
+            role_employee = st.checkbox("入力者権限", value=True)
+
+        manager_emp_no = st.text_input("上長の従業員番号（任意）", placeholder="例: 010000（評価者）")
+        ok = st.form_submit_button("保存")
+
+    if ok:
+        emp_no = emp_no.strip()
+        name = name.strip()
+        if not emp_no or not name:
+            st.error("従業員番号と氏名は必須です。")
+        elif not (role_admin or role_manager or role_employee):
+            st.error("少なくとも1つの権限を付与してください。")
+        else:
+            password = password or "ChangeMe_1234"
+
+            with SessionLocal() as db:
+                existing = db.execute(select(Employee).where(Employee.emp_no == emp_no)).scalar_one_or_none()
+                if existing:
+                    existing.name = name
+                    existing.department = department.strip()
+                    existing.email = email.strip() or None
+                    existing.active = bool(active)
+                    existing.role_admin = bool(role_admin)
+                    existing.role_manager = bool(role_manager)
+                    existing.role_employee = bool(role_employee)
+                    existing.manager_emp_no = manager_emp_no.strip() or None
+
+                    existing.password_hash = PWD_CONTEXT.hash(password)
+                    existing.must_change_password = True
+                    existing.password_updated_at = None
+
+                    db.add(existing)
+                    db.commit()
+                    st.success("更新しました（次回ログインでPW変更必須）。")
+                else:
+                    db.add(
+                        Employee(
+                            emp_no=emp_no,
+                            name=name,
+                            department=department.strip(),
+                            email=email.strip() or None,
+                            password_hash=PWD_CONTEXT.hash(password),
+                            active=bool(active),
+                            role_admin=bool(role_admin),
+                            role_manager=bool(role_manager),
+                            role_employee=bool(role_employee),
+                            manager_emp_no=manager_emp_no.strip() or None,
+                            manager_email=None,
+                            must_change_password=True,
+                            password_updated_at=None,
+                            last_login_at=None,
+                        )
+                    )
+                    db.commit()
+                    st.success("追加しました（次回ログインでPW変更必須）。")
+
+    st.markdown("---")
+    st.markdown("### 従業員一覧 / パスワードリセット")
+
+    with SessionLocal() as db:
+        emps = db.execute(select(Employee).order_by(Employee.emp_no.asc())).scalars().all()
+        if not emps:
+            st.warning("従業員がいません。")
+            return
+
+        options = {f"{e.emp_no} {e.name}（{e.department}）": e.emp_no for e in emps}
+        selected_label = st.selectbox("リセット対象を選択", list(options.keys()))
+        selected_emp_no = options[selected_label]
+
+        colr1, colr2 = st.columns([1, 2])
+        with colr1:
+            do_reset = st.button("ChangeMe_1234 にリセット")
+        with colr2:
+            st.caption("リセット後、ユーザーは次回ログインで必ずPW変更します。")
+
+        if do_reset:
+            emp = db.execute(select(Employee).where(Employee.emp_no == selected_emp_no)).scalar_one()
+            emp.password_hash = PWD_CONTEXT.hash("ChangeMe_1234")
+            emp.must_change_password = True
+            emp.password_updated_at = None
+            db.add(emp)
+            db.commit()
+            st.success("ChangeMe_1234 にリセットしました。")
+
+        rows = [
+            {
+                "emp_no": e.emp_no,
+                "name": e.name,
+                "department": e.department,
+                "email": e.email or "",
+                "active": "○" if e.active else "×",
+                "role_admin": "○" if e.role_admin else "",
+                "role_manager": "○" if e.role_manager else "",
+                "role_employee": "○" if e.role_employee else "",
+                "manager_emp_no": e.manager_emp_no or "",
+                "must_change_pw": "○" if e.must_change_password else "",
+            }
+            for e in emps
+        ]
+        st.dataframe(rows, use_container_width=True)
+
+
+# =============================================================================
+# Goals: helpers
+# =============================================================================
 def _default_business_row() -> Dict[str, Any]:
     return {
         "①今回の対象となる業務": "",
         "②達成したい結果": "",
-        "③期限": None,  # date
+        "③期限": None,
         "④部署ゴールとの関連性": "",
         "実行計画(任意)": "",
         "達成率%(0-200)": 0,
@@ -1466,7 +1442,7 @@ def _default_development_row() -> Dict[str, Any]:
         "②現在の自分とのギャップ": "",
         "③どのような行動を行いますか？": "",
         "実行計画(任意)": "",
-        "完了時期(任意)": None,  # date
+        "完了時期(任意)": None,
     }
 
 
@@ -1475,6 +1451,10 @@ def _row_has_any_text(row: Dict[str, Any], keys: List[str]) -> bool:
 
 
 def validate_goal_rows_new(biz_rows: List[Dict[str, Any]], dev_rows: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+    """
+    - business: 最大5件。1件目必須。2件目以降は任意だが「入力した行」は①必須。
+    - development: 最大2件。1件目必須。2件目以降は任意だが「入力した行」は①必須。
+    """
     errors: List[str] = []
 
     def nonempty(v: Any) -> bool:
@@ -1490,9 +1470,17 @@ def validate_goal_rows_new(biz_rows: List[Dict[str, Any]], dev_rows: List[Dict[s
     if len(dev_rows) > MAX_DEV_GOALS:
         errors.append(f"development goal は最大{MAX_DEV_GOALS}件までです。")
 
+    if biz_rows and not nonempty(biz_rows[0].get("①今回の対象となる業務")):
+        errors.append("business goal #1: ①今回の対象となる業務 は必須です。")
+
     for i, r in enumerate(biz_rows, start=1):
-        if not nonempty(r.get("①今回の対象となる業務")):
-            errors.append(f"business goal #{i}: ①今回の対象となる業務 は必須です。")
+        if i >= 2:
+            has_any = _row_has_any_text(
+                r, ["①今回の対象となる業務", "②達成したい結果", "④部署ゴールとの関連性", "実行計画(任意)"]
+            ) or (r.get("③期限") is not None)
+            if has_any and not nonempty(r.get("①今回の対象となる業務")):
+                errors.append(f"business goal #{i}: ①今回の対象となる業務 は必須です。")
+
         try:
             p = int(r.get("達成率%(0-200)", 0) or 0)
             if p < 0 or p > 200:
@@ -1500,9 +1488,17 @@ def validate_goal_rows_new(biz_rows: List[Dict[str, Any]], dev_rows: List[Dict[s
         except Exception:
             errors.append(f"business goal #{i}: 達成率% は数値で入力してください。")
 
+    if dev_rows and not nonempty(dev_rows[0].get("①なりたい人物像/身につけたいスキル")):
+        errors.append("development goal #1: ①なりたい人物像/身につけたいスキル は必須です。")
+
     for i, r in enumerate(dev_rows, start=1):
-        if not nonempty(r.get("①なりたい人物像/身につけたいスキル")):
-            errors.append(f"development goal #{i}: ①なりたい人物像/身につけたいスキル は必須です。")
+        if i >= 2:
+            has_any = _row_has_any_text(
+                r,
+                ["①なりたい人物像/身につけたいスキル", "②現在の自分とのギャップ", "③どのような行動を行いますか？", "実行計画(任意)"],
+            ) or (r.get("完了時期(任意)") is not None)
+            if has_any and not nonempty(r.get("①なりたい人物像/身につけたいスキル")):
+                errors.append(f"development goal #{i}: ①なりたい人物像/身につけたいスキル は必須です。")
 
     return (len(errors) == 0), errors
 
@@ -1520,6 +1516,9 @@ def load_or_create_goal(db, emp_no: str, year: int) -> Goal:
     return goal
 
 
+# =============================================================================
+# Goals: pages
+# =============================================================================
 def page_goal_input() -> None:
     user = require_role("入力者")
     section_title("Goal Input", "🎣")
@@ -1570,7 +1569,7 @@ def page_goal_input() -> None:
 
             st.session_state[state_key] = {"biz": biz_rows, "dev": dev_rows}
 
-        st.markdown(f"### business goal（最大{MAX_BIZ_GOALS}件 / ①だけ必須）")
+        st.markdown(f"### business goal（最大{MAX_BIZ_GOALS}件 / #1必須）")
         st.caption("期限は日付入力。実行計画は任意。達成率は評価で使用（0〜200%）。")
         biz_rows = st.data_editor(
             st.session_state[state_key]["biz"],
@@ -1582,7 +1581,7 @@ def page_goal_input() -> None:
             biz_rows = biz_rows[:MAX_BIZ_GOALS]
             st.warning(f"business goal は最大{MAX_BIZ_GOALS}件までです。超過分は切り捨てました。")
 
-        st.markdown(f"### development goal（最大{MAX_DEV_GOALS}件 / ①だけ必須）")
+        st.markdown(f"### development goal（最大{MAX_DEV_GOALS}件 / #1必須）")
         st.caption("完了時期(任意)は日付入力。実行計画は任意。")
         dev_rows = st.data_editor(
             st.session_state[state_key]["dev"],
@@ -1609,7 +1608,6 @@ def page_goal_input() -> None:
         if not (save or submit):
             return
 
-        # trim empty rows
         biz_trim = [
             r
             for r in biz_rows
@@ -1620,7 +1618,8 @@ def page_goal_input() -> None:
             r
             for r in dev_rows
             if _row_has_any_text(
-                r, ["①なりたい人物像/身につけたいスキル", "②現在の自分とのギャップ", "③どのような行動を行いますか？", "実行計画(任意)"]
+                r,
+                ["①なりたい人物像/身につけたいスキル", "②現在の自分とのギャップ", "③どのような行動を行いますか？", "実行計画(任意)"],
             )
             or r.get("完了時期(任意)") is not None
         ]
@@ -1636,19 +1635,16 @@ def page_goal_input() -> None:
             st.error("上長が設定されていないためSubmitできません。")
             st.stop()
 
-        # ★重要：差戻し→再Submitなどの時にセッション内の goal が変な状態にならないよう再取得
         goal_db = db.execute(select(Goal).where(Goal.id == goal.id)).scalar_one()
         if not can_edit_goal(goal_db.status):
             st.error("この目標は編集できない状態です。")
             st.stop()
 
-        # delete old items
         old_items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal_db.id)).scalars().all()
         for it in old_items:
             db.delete(it)
         db.flush()
 
-        # insert new items
         for r in biz_trim:
             db.add(
                 GoalItem(
@@ -1661,7 +1657,7 @@ def page_goal_input() -> None:
                     time_bound="",
                     career_vision=None,
                     deadline_date=r.get("③期限"),
-                    weight=None,  # 廃止
+                    weight=None,
                     achieved_percent=int(r.get("達成率%(0-200)", 0) or 0),
                 )
             )
@@ -1697,7 +1693,11 @@ def page_goal_input() -> None:
             manager = db.execute(select(Employee).where(Employee.emp_no == emp.manager_emp_no)).scalar_one_or_none()
             if manager and manager.email:
                 subject = f"【目標管理】{user.name}さんが目標を提出しました（{year}年度）"
-                body = f"こんにちは、\n\n{user.name}さんが{year}年度の目標を提出しました。\n確認・承認をお願いいたします。\n\n---\n本メールは自動送信されています。"
+                body = (
+                    "こんにちは、\n\n"
+                    f"{user.name}さんが{year}年度の目標を提出しました。\n"
+                    "確認・承認をお願いいたします。\n\n---\n本メールは自動送信されています。"
+                )
                 send_email(manager.email, subject, body)
 
         st.session_state.pop(state_key, None)
@@ -1858,7 +1858,7 @@ def page_goal_approve_manager() -> None:
             db.commit()
             st.success("承認しました（HRへ提出）。")
 
-            hr_admins = db.execute(select(Employee).where(Employee.role_admin == True)).scalars().all()
+            hr_admins = db.execute(select(Employee).where(Employee.role_admin.is_(True))).scalars().all()
             emp = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
             subject = f"【目標管理】{emp.name if emp else ''}さんの目標が上長承認されました"
             body = (
@@ -1883,16 +1883,15 @@ def page_goal_approve_manager() -> None:
             st.rerun()
 
 
-# ----------------------------
-# Goals Approval (HR)
-# ----------------------------
 def page_goal_approve_hr() -> None:
     user = require_role("HR管理者")
     section_title("Confirm Goals (HR)", "✔️")
     year = get_selected_year()
 
     with SessionLocal() as db:
-        candidates = db.execute(select(Goal).where(Goal.year == year, Goal.status == "manager_approved").order_by(Goal.updated_at.desc())).scalars().all()
+        candidates = db.execute(
+            select(Goal).where(Goal.year == year, Goal.status == "manager_approved").order_by(Goal.updated_at.desc())
+        ).scalars().all()
         if not candidates:
             st.info("HR確認待ちの目標がありません。")
             return
@@ -1950,10 +1949,11 @@ def page_goal_approve_hr() -> None:
             st.warning("差し戻しました（社員が修正→再Submit）。")
             st.rerun()
 
+# app.py (Part 4/4)
 
-# ----------------------------
-# Evaluation (Self/Manager/HR) + View
-# ----------------------------
+# =============================================================================
+# Evaluation: pages (Self / Manager / HR)
+# =============================================================================
 def page_eval_input_self() -> None:
     user = require_role("入力者")
     section_title("Self Evaluation", "⭐")
@@ -1977,17 +1977,21 @@ def page_eval_input_self() -> None:
 
         st.markdown("### what（business goal 達成度）")
         st.caption("各business goalの達成率を入力してください（0〜200%）。")
+
         state_key = f"es:biz:{user.emp_no}:{year}"
         if state_key not in st.session_state:
             st.session_state[state_key] = [{"id": it.id, "達成率%(0-200)": it.achieved_percent or 0} for it in biz]
 
-        editor_rows = []
+        editor_rows: List[Dict[str, Any]] = []
         for it in biz:
             editor_rows.append(
                 {
                     "目標ID": it.id,
                     "①今回の対象となる業務": (it.specific or "")[:40] + ("…" if it.specific and len(it.specific) > 40 else ""),
-                    "達成率%(0-200)": next((r["達成率%(0-200)"] for r in st.session_state[state_key] if r["id"] == it.id), it.achieved_percent or 0),
+                    "達成率%(0-200)": next(
+                        (r["達成率%(0-200)"] for r in st.session_state[state_key] if r["id"] == it.id),
+                        it.achieved_percent or 0,
+                    ),
                 }
             )
         updated = st.data_editor(editor_rows, num_rows="fixed", use_container_width=True)
@@ -2003,7 +2007,9 @@ def page_eval_input_self() -> None:
         st.info(f"what（自己）プレビュー: {what}（平均 {pct:.1f}%）")
 
         st.markdown("---")
+        # ✅ FIX: 元コードで壊れていた st.markdown 行（構文エラー）を正常化
         st.markdown("### how（8カテゴリ×5問 / 1〜4点）")
+
         questions = db.execute(select(HowQuestion).where(HowQuestion.active.is_(True))).scalars().all()
         qmap: Dict[str, List[HowQuestion]] = {}
         for q in questions:
@@ -2053,7 +2059,6 @@ def page_eval_input_self() -> None:
             db.add(it)
         db.flush()
 
-        # replace self answers
         for a in db.execute(select(HowAnswer).where(HowAnswer.evaluation_id == ev.id, HowAnswer.rater == "self")).scalars().all():
             db.delete(a)
         db.flush()
@@ -2061,7 +2066,15 @@ def page_eval_input_self() -> None:
         for cat_key, _ in HOW_CATEGORIES:
             for q in qmap.get(cat_key, []):
                 sc = int(st.session_state[f"es_ans:{ev.id}:{cat_key}:{q.question_no}"])
-                db.add(HowAnswer(evaluation_id=ev.id, rater="self", category_key=cat_key, question_no=q.question_no, score=sc))
+                db.add(
+                    HowAnswer(
+                        evaluation_id=ev.id,
+                        rater="self",
+                        category_key=cat_key,
+                        question_no=q.question_no,
+                        score=sc,
+                    )
+                )
 
         _, what2 = calc_what_from_business(biz)
         _, _, how2 = calc_how_from_scores(scores)
@@ -2071,8 +2084,28 @@ def page_eval_input_self() -> None:
         ev.self_comment = comment.strip()
         ev.status = "draft" if save else "submitted_self"
         db.add(ev)
-        db.add(EvaluationApproval(evaluation_id=ev.id, stage="self", action="save" if save else "submit", comment="", actor_emp_no=user.emp_no))
+        db.add(
+            EvaluationApproval(
+                evaluation_id=ev.id,
+                stage="self",
+                action="save" if save else "submit",
+                comment="",
+                actor_emp_no=user.emp_no,
+            )
+        )
         db.commit()
+
+        if submit:
+            emp = db.execute(select(Employee).where(Employee.emp_no == user.emp_no)).scalar_one_or_none()
+            manager = db.execute(select(Employee).where(Employee.emp_no == (emp.manager_emp_no if emp else ""))).scalar_one_or_none()
+            if manager and manager.email:
+                subject = f"【評価】{user.name}さんが自己評価を提出しました（{year}年度）"
+                body = (
+                    "こんにちは,\n\n"
+                    f"{user.name}さんが{year}年度の自己評価を提出しました。\n"
+                    "評価をお願いいたします。\n\n---\n本メールは自動送信されています。"
+                )
+                send_email(manager.email, subject, body)
 
         st.success("保存しました。" if save else "提出しました（上長評価待ち）。")
         st.rerun()
@@ -2142,6 +2175,7 @@ def page_eval_input_manager() -> None:
 
         st.markdown("---")
         st.markdown("### how（上長評価）")
+
         questions = db.execute(select(HowQuestion).where(HowQuestion.active.is_(True))).scalars().all()
         qmap: Dict[str, List[HowQuestion]] = {}
         for q in questions:
@@ -2172,6 +2206,7 @@ def page_eval_input_manager() -> None:
 
         st.markdown("---")
         comment = st.text_area("上長コメント（差し戻し時は必須）", value=ev.manager_comment or "", key=f"em_comment:{ev.id}")
+
         c1, c2, c3 = st.columns(3)
         with c1:
             save = st.button("保存（下書き）", use_container_width=True)
@@ -2194,7 +2229,15 @@ def page_eval_input_manager() -> None:
         for cat_key, _ in HOW_CATEGORIES:
             for q in qmap.get(cat_key, []):
                 sc = int(st.session_state[f"em_ans:{ev.id}:{cat_key}:{q.question_no}"])
-                db.add(HowAnswer(evaluation_id=ev.id, rater="manager", category_key=cat_key, question_no=q.question_no, score=sc))
+                db.add(
+                    HowAnswer(
+                        evaluation_id=ev.id,
+                        rater="manager",
+                        category_key=cat_key,
+                        question_no=q.question_no,
+                        score=sc,
+                    )
+                )
 
         _, _, how_mgr2 = calc_how_from_scores(scores)
         ev.what_manager = what_manager
@@ -2212,8 +2255,29 @@ def page_eval_input_manager() -> None:
             act = "return"
 
         db.add(ev)
-        db.add(EvaluationApproval(evaluation_id=ev.id, stage="manager", action=act, comment=comment.strip() if act == "return" else "", actor_emp_no=user.emp_no))
+        db.add(
+            EvaluationApproval(
+                evaluation_id=ev.id,
+                stage="manager",
+                action=act,
+                comment=comment.strip() if act == "return" else "",
+                actor_emp_no=user.emp_no,
+            )
+        )
         db.commit()
+
+        if submit:
+            hr_admins = db.execute(select(Employee).where(Employee.role_admin.is_(True))).scalars().all()
+            emp = db.execute(select(Employee).where(Employee.emp_no == ev.employee_emp_no)).scalar_one_or_none()
+            subject = f"【評価】{emp.name if emp else ''}さんの{ev.year}年度評価が上長提出されました"
+            body = (
+                "こんにちは,\n\n"
+                f"{emp.name if emp else ''}さんの{ev.year}年度評価が上長（{user.name}さん）により提出されました。\n"
+                "HR確認をお願いいたします。\n\n---\n本メールは自動送信されています。"
+            )
+            for hr in hr_admins:
+                if hr.email:
+                    send_email(hr.email, subject, body)
 
         st.success("保存しました。" if save else ("提出しました（HR確認待ち）。" if submit else "差し戻しました。"))
         st.rerun()
@@ -2252,6 +2316,11 @@ def page_eval_approve_hr() -> None:
         st.write(f"自己コメント: {ev.self_comment}")
         st.write(f"上長コメント: {ev.manager_comment}")
 
+        st.markdown("### how レーダー（自己 vs 上長）")
+        self_ans = db.execute(select(HowAnswer).where(HowAnswer.evaluation_id == ev.id, HowAnswer.rater == "self")).scalars().all()
+        mgr_ans = db.execute(select(HowAnswer).where(HowAnswer.evaluation_id == ev.id, HowAnswer.rater == "manager")).scalars().all()
+        radar_chart(category_averages(self_ans), category_averages(mgr_ans))
+
         st.markdown("---")
         comment = st.text_area("HRコメント（差し戻し時は必須）", value=ev.hr_comment or "", key=f"eh_comment:{ev.id}")
         c1, c2 = st.columns(2)
@@ -2266,7 +2335,15 @@ def page_eval_approve_hr() -> None:
             ev.how_final = ev.how_manager or (ev.how_self or "does_not_meet")
             ev.hr_comment = comment.strip()
             db.add(ev)
-            db.add(EvaluationApproval(evaluation_id=ev.id, stage="hr", action="approve", comment=comment.strip(), actor_emp_no=user.emp_no))
+            db.add(
+                EvaluationApproval(
+                    evaluation_id=ev.id,
+                    stage="hr",
+                    action="approve",
+                    comment=comment.strip(),
+                    actor_emp_no=user.emp_no,
+                )
+            )
             db.commit()
             st.success("HR確認しました。上長は1on1設定ができます。")
             st.rerun()
@@ -2278,15 +2355,23 @@ def page_eval_approve_hr() -> None:
             ev.status = "hr_returned"
             ev.hr_comment = comment.strip()
             db.add(ev)
-            db.add(EvaluationApproval(evaluation_id=ev.id, stage="hr", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
+            db.add(
+                EvaluationApproval(
+                    evaluation_id=ev.id,
+                    stage="hr",
+                    action="return",
+                    comment=comment.strip(),
+                    actor_emp_no=user.emp_no,
+                )
+            )
             db.commit()
             st.warning("差し戻しました（上長が修正→再提出）。")
             st.rerun()
 
 
-# ----------------------------
-# 1on1
-# ----------------------------
+# =============================================================================
+# 1on1 (Manager / Employee)
+# =============================================================================
 def page_oneonone_manager() -> None:
     user = require_role("評価者")
     section_title("Schedule 1:1 Meeting", "📅")
@@ -2317,11 +2402,23 @@ def page_oneonone_manager() -> None:
         st.caption(f"年度: {year} / 1on1状態: {o1.status}")
 
         slot1_d = st.date_input("候補1（日付）", value=datetime.utcnow().date(), key=f"o1_slot1_d:{o1.id}")
-        slot1_t = st.time_input("候補1（時刻）", value=datetime.utcnow().time().replace(second=0, microsecond=0), key=f"o1_slot1_t:{o1.id}")
+        slot1_t = st.time_input(
+            "候補1（時刻）",
+            value=datetime.utcnow().time().replace(second=0, microsecond=0),
+            key=f"o1_slot1_t:{o1.id}",
+        )
         slot2_d = st.date_input("候補2（日付）", value=datetime.utcnow().date(), key=f"o1_slot2_d:{o1.id}")
-        slot2_t = st.time_input("候補2（時刻）", value=datetime.utcnow().time().replace(second=0, microsecond=0), key=f"o1_slot2_t:{o1.id}")
+        slot2_t = st.time_input(
+            "候補2（時刻）",
+            value=datetime.utcnow().time().replace(second=0, microsecond=0),
+            key=f"o1_slot2_t:{o1.id}",
+        )
         slot3_d = st.date_input("候補3（日付）", value=datetime.utcnow().date(), key=f"o1_slot3_d:{o1.id}")
-        slot3_t = st.time_input("候補3（時刻）", value=datetime.utcnow().time().replace(second=0, microsecond=0), key=f"o1_slot3_t:{o1.id}")
+        slot3_t = st.time_input(
+            "候補3（時刻）",
+            value=datetime.utcnow().time().replace(second=0, microsecond=0),
+            key=f"o1_slot3_t:{o1.id}",
+        )
 
         location = st.text_input("場所/オンラインURL", value=o1.location or "", key=f"o1_loc:{o1.id}")
         note = st.text_area("メモ", value=o1.note or "", key=f"o1_note:{o1.id}")
@@ -2394,9 +2491,9 @@ def page_oneonone_employee() -> None:
             st.rerun()
 
 
-# ----------------------------
-# Approval status
-# ----------------------------
+# =============================================================================
+# Approval status (Employee)
+# =============================================================================
 def page_approval_status_self() -> None:
     user = require_role("入力者")
     section_title("Approval Status", "📊")
@@ -2428,7 +2525,9 @@ def page_approval_status_self() -> None:
             st.write("未開始")
         else:
             st.write(f"状態: {status_label_eval(ev.status)}")
-            approvals = db.execute(select(EvaluationApproval).where(EvaluationApproval.evaluation_id == ev.id).order_by(EvaluationApproval.acted_at.asc())).scalars().all()
+            approvals = db.execute(
+                select(EvaluationApproval).where(EvaluationApproval.evaluation_id == ev.id).order_by(EvaluationApproval.acted_at.asc())
+            ).scalars().all()
             rows = [
                 {
                     "日時": a.acted_at.strftime("%Y-%m-%d %H:%M"),
@@ -2441,9 +2540,9 @@ def page_approval_status_self() -> None:
             st.dataframe(rows, use_container_width=True)
 
 
-# ----------------------------
+# =============================================================================
 # HR Dashboard
-# ----------------------------
+# =============================================================================
 def page_hr_dashboard() -> None:
     require_role("HR管理者")
     section_title("HR Dashboard", "📈")
@@ -2476,15 +2575,21 @@ def page_hr_dashboard() -> None:
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### 目標 進捗（件数）")
-            st.dataframe([{"status": GOAL_STATUSES[k], "count": goal_counts.get(k, 0)} for k in GOAL_STATUSES.keys()], use_container_width=True)
+            st.dataframe(
+                [{"status": GOAL_STATUSES[k], "count": goal_counts.get(k, 0)} for k in GOAL_STATUSES.keys()],
+                use_container_width=True,
+            )
         with c2:
             st.markdown("### 評価 進捗（件数）")
-            st.dataframe([{"status": EVAL_STATUSES[k], "count": eval_counts.get(k, 0)} for k in EVAL_STATUSES.keys()], use_container_width=True)
+            st.dataframe(
+                [{"status": EVAL_STATUSES[k], "count": eval_counts.get(k, 0)} for k in EVAL_STATUSES.keys()],
+                use_container_width=True,
+            )
 
 
-# ----------------------------
+# =============================================================================
 # Admin CSV Export
-# ----------------------------
+# =============================================================================
 def page_admin_csv() -> None:
     require_role("HR管理者")
     section_title("Export CSV", "📥")
@@ -2520,7 +2625,12 @@ def page_admin_csv() -> None:
                     }
                 )
 
-        st.download_button("goals.csv をダウンロード", data=to_csv(rows).encode("utf-8"), file_name="goals.csv", mime="text/csv")
+        st.download_button(
+            "goals.csv をダウンロード",
+            data=to_csv(rows).encode("utf-8"),
+            file_name="goals.csv",
+            mime="text/csv",
+        )
 
         st.markdown("---")
         st.markdown("### 評価CSV（上長提出時点でDL可）")
@@ -2559,9 +2669,9 @@ def page_admin_csv() -> None:
         )
 
 
-# ----------------------------
-# Router
-# ----------------------------
+# =============================================================================
+# Router / main
+# =============================================================================
 PAGES: Dict[str, Callable[[], None]] = {
     # auth
     "login": page_login,
@@ -2580,7 +2690,7 @@ PAGES: Dict[str, Callable[[], None]] = {
     "goal_approve_manager": page_goal_approve_manager,
     "eval_input_manager": page_eval_input_manager,
     "oneonone_manager": page_oneonone_manager,
-    # admin
+    # admin/hr
     "hr_dashboard": page_hr_dashboard,
     "admin_employee_master": page_admin_employee_master,
     "goal_approve_hr": page_goal_approve_hr,
