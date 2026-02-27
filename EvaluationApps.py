@@ -1519,10 +1519,189 @@ def load_or_create_goal(db, emp_no: str, year: int) -> Goal:
 # =============================================================================
 # Goals: pages
 # =============================================================================
+
 def page_goal_input() -> None:
     user = require_role("入力者")
     section_title("Goal Input", "🎣")
     year = get_selected_year()
+
+    def _ensure_state(goal: Goal) -> str:
+        state_key = f"goal:{user.emp_no}:{year}"
+        if state_key in st.session_state:
+            return state_key
+
+        biz_rows: List[Dict[str, Any]] = []
+        dev_rows: List[Dict[str, Any]] = []
+
+        for it in goal.items:
+            if it.type == "business":
+                biz_rows.append(
+                    {
+                        "①今回の対象となる業務": it.specific,
+                        "②達成したい結果": it.measurable,
+                        "③期限": it.deadline_date,
+                        "④部署ゴールとの関連性": it.relevant,
+                        "実行計画(任意)": it.achievable,
+                        "達成率%(0-200)": it.achieved_percent or 0,
+                    }
+                )
+            else:
+                dev_rows.append(
+                    {
+                        "①なりたい人物像/身につけたいスキル": it.career_vision or "",
+                        "②現在の自分とのギャップ": it.specific,
+                        "③どのような行動を行いますか？": it.measurable,
+                        "実行計画(任意)": it.achievable,
+                        "完了時期(任意)": it.deadline_date,
+                    }
+                )
+
+        if not biz_rows:
+            biz_rows = [_default_business_row()]
+        if not dev_rows:
+            dev_rows = [_default_development_row()]
+
+        st.session_state[state_key] = {"biz": biz_rows, "dev": dev_rows}
+        return state_key
+
+    def _render_business_form(rows: List[Dict[str, Any]], *, editable: bool) -> List[Dict[str, Any]]:
+        st.markdown(f"### business goal（最大{MAX_BIZ_GOALS}件 / #1必須）")
+        st.caption("期限は日付入力。実行計画は任意。達成率は評価で使用（0〜200%）。")
+
+        updated = [dict(r) for r in rows]
+
+        for i in range(len(updated)):
+            is_first = i == 0
+            title = f"business goal #{i+1}" + ("（必須）" if is_first else "")
+            with st.expander(title, expanded=is_first):
+                updated[i]["①今回の対象となる業務"] = st.text_area(
+                    "①今回の対象となる業務",
+                    value=str(updated[i].get("①今回の対象となる業務", "") or ""),
+                    disabled=not editable,
+                    key=f"biz_{i}_specific_{user.emp_no}_{year}",
+                    height=80,
+                )
+                updated[i]["②達成したい結果"] = st.text_area(
+                    "②達成したい結果",
+                    value=str(updated[i].get("②達成したい結果", "") or ""),
+                    disabled=not editable,
+                    key=f"biz_{i}_measurable_{user.emp_no}_{year}",
+                    height=80,
+                )
+                updated[i]["③期限"] = st.date_input(
+                    "③期限",
+                    value=updated[i].get("③期限") or None,
+                    disabled=not editable,
+                    key=f"biz_{i}_deadline_{user.emp_no}_{year}",
+                )
+                updated[i]["④部署ゴールとの関連性"] = st.text_area(
+                    "④部署ゴールとの関連性",
+                    value=str(updated[i].get("④部署ゴールとの関連性", "") or ""),
+                    disabled=not editable,
+                    key=f"biz_{i}_relevant_{user.emp_no}_{year}",
+                    height=80,
+                )
+                updated[i]["実行計画(任意)"] = st.text_area(
+                    "実行計画(任意)",
+                    value=str(updated[i].get("実行計画(任意)", "") or ""),
+                    disabled=not editable,
+                    key=f"biz_{i}_plan_{user.emp_no}_{year}",
+                    height=80,
+                )
+                updated[i]["達成率%(0-200)"] = st.number_input(
+                    "達成率%(0-200)",
+                    min_value=0,
+                    max_value=200,
+                    value=int(updated[i].get("達成率%(0-200)", 0) or 0),
+                    step=1,
+                    disabled=not editable,
+                    key=f"biz_{i}_pct_{user.emp_no}_{year}",
+                )
+
+                if editable and not is_first:
+                    if st.button("🗑️ このbusiness goalを削除", use_container_width=True, key=f"biz_{i}_del_{user.emp_no}_{year}"):
+                        updated.pop(i)
+                        st.rerun()
+
+        if editable:
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                if st.button("＋ business goalを追加", use_container_width=True, disabled=(len(updated) >= MAX_BIZ_GOALS)):
+                    updated.append(_default_business_row())
+                    st.rerun()
+            with c2:
+                st.caption(f"現在 {len(updated)}/{MAX_BIZ_GOALS}")
+
+        if len(updated) > MAX_BIZ_GOALS:
+            updated = updated[:MAX_BIZ_GOALS]
+            st.warning(f"business goal は最大{MAX_BIZ_GOALS}件までです。超過分は切り捨てました。")
+
+        return updated
+
+    def _render_development_form(rows: List[Dict[str, Any]], *, editable: bool) -> List[Dict[str, Any]]:
+        st.markdown(f"### development goal（最大{MAX_DEV_GOALS}件 / #1必須）")
+        st.caption("完了時期(任意)は日付入力。実行計画は任意。")
+
+        updated = [dict(r) for r in rows]
+
+        for i in range(len(updated)):
+            is_first = i == 0
+            title = f"development goal #{i+1}" + ("（必須）" if is_first else "")
+            with st.expander(title, expanded=is_first):
+                updated[i]["①なりたい人物像/身につけたいスキル"] = st.text_area(
+                    "①なりたい人物像/身につけたいスキル",
+                    value=str(updated[i].get("①なりたい人物像/身につけたいスキル", "") or ""),
+                    disabled=not editable,
+                    key=f"dev_{i}_vision_{user.emp_no}_{year}",
+                    height=80,
+                )
+                updated[i]["②現在の自分とのギャップ"] = st.text_area(
+                    "②現在の自分とのギャップ",
+                    value=str(updated[i].get("②現在の自分とのギャップ", "") or ""),
+                    disabled=not editable,
+                    key=f"dev_{i}_gap_{user.emp_no}_{year}",
+                    height=80,
+                )
+                updated[i]["③どのような行動を行いますか？"] = st.text_area(
+                    "③どのような行動を行いますか？",
+                    value=str(updated[i].get("③どのような行動を行いますか？", "") or ""),
+                    disabled=not editable,
+                    key=f"dev_{i}_action_{user.emp_no}_{year}",
+                    height=80,
+                )
+                updated[i]["実行計画(任意)"] = st.text_area(
+                    "実行計画(任意)",
+                    value=str(updated[i].get("実行計画(任意)", "") or ""),
+                    disabled=not editable,
+                    key=f"dev_{i}_plan_{user.emp_no}_{year}",
+                    height=80,
+                )
+                updated[i]["完了時期(任意)"] = st.date_input(
+                    "完了時期(任意)",
+                    value=updated[i].get("完了時期(任意)") or None,
+                    disabled=not editable,
+                    key=f"dev_{i}_deadline_{user.emp_no}_{year}",
+                )
+
+                if editable and not is_first:
+                    if st.button("🗑️ このdevelopment goalを削除", use_container_width=True, key=f"dev_{i}_del_{user.emp_no}_{year}"):
+                        updated.pop(i)
+                        st.rerun()
+
+        if editable:
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                if st.button("＋ development goalを追加", use_container_width=True, disabled=(len(updated) >= MAX_DEV_GOALS)):
+                    updated.append(_default_development_row())
+                    st.rerun()
+            with c2:
+                st.caption(f"現在 {len(updated)}/{MAX_DEV_GOALS}")
+
+        if len(updated) > MAX_DEV_GOALS:
+            updated = updated[:MAX_DEV_GOALS]
+            st.warning(f"development goal は最大{MAX_DEV_GOALS}件までです。超過分は切り捨てました。")
+
+        return updated
 
     with SessionLocal() as db:
         emp = db.execute(select(Employee).where(Employee.emp_no == user.emp_no)).scalar_one()
@@ -1534,64 +1713,11 @@ def page_goal_input() -> None:
         st.caption(f"年度: {year} / 状態: {status_label_goal(goal.status)}")
         editable = can_edit_goal(goal.status)
 
-        state_key = f"goal:{user.emp_no}:{year}"
-        if state_key not in st.session_state:
-            biz_rows: List[Dict[str, Any]] = []
-            dev_rows: List[Dict[str, Any]] = []
+        state_key = _ensure_state(goal)
 
-            for it in goal.items:
-                if it.type == "business":
-                    biz_rows.append(
-                        {
-                            "①今回の対象となる業務": it.specific,
-                            "②達成したい結果": it.measurable,
-                            "③期限": it.deadline_date,
-                            "④部署ゴールとの関連性": it.relevant,
-                            "実行計画(任意)": it.achievable,
-                            "達成率%(0-200)": it.achieved_percent or 0,
-                        }
-                    )
-                else:
-                    dev_rows.append(
-                        {
-                            "①なりたい人物像/身につけたいスキル": it.career_vision or "",
-                            "②現在の自分とのギャップ": it.specific,
-                            "③どのような行動を行いますか？": it.measurable,
-                            "実行計画(任意)": it.achievable,
-                            "完了時期(任意)": it.deadline_date,
-                        }
-                    )
-
-            if not biz_rows:
-                biz_rows = [_default_business_row()]
-            if not dev_rows:
-                dev_rows = [_default_development_row()]
-
-            st.session_state[state_key] = {"biz": biz_rows, "dev": dev_rows}
-
-        st.markdown(f"### business goal（最大{MAX_BIZ_GOALS}件 / #1必須）")
-        st.caption("期限は日付入力。実行計画は任意。達成率は評価で使用（0〜200%）。")
-        biz_rows = st.data_editor(
-            st.session_state[state_key]["biz"],
-            num_rows="dynamic" if editable else "fixed",
-            use_container_width=True,
-            disabled=not editable,
-        )
-        if len(biz_rows) > MAX_BIZ_GOALS:
-            biz_rows = biz_rows[:MAX_BIZ_GOALS]
-            st.warning(f"business goal は最大{MAX_BIZ_GOALS}件までです。超過分は切り捨てました。")
-
-        st.markdown(f"### development goal（最大{MAX_DEV_GOALS}件 / #1必須）")
-        st.caption("完了時期(任意)は日付入力。実行計画は任意。")
-        dev_rows = st.data_editor(
-            st.session_state[state_key]["dev"],
-            num_rows="dynamic" if editable else "fixed",
-            use_container_width=True,
-            disabled=not editable,
-        )
-        if len(dev_rows) > MAX_DEV_GOALS:
-            dev_rows = dev_rows[:MAX_DEV_GOALS]
-            st.warning(f"development goal は最大{MAX_DEV_GOALS}件までです。超過分は切り捨てました。")
+        biz_rows = _render_business_form(st.session_state[state_key]["biz"], editable=editable)
+        st.markdown("---")
+        dev_rows = _render_development_form(st.session_state[state_key]["dev"], editable=editable)
 
         st.session_state[state_key]["biz"] = biz_rows
         st.session_state[state_key]["dev"] = dev_rows
@@ -1702,7 +1828,6 @@ def page_goal_input() -> None:
 
         st.session_state.pop(state_key, None)
         st.rerun()
-
 
 def page_goal_view_self() -> None:
     user = require_role("入力者")
