@@ -1,4 +1,3 @@
-# app.py (Part 1/4)
 from __future__ import annotations
 
 import csv
@@ -33,7 +32,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 # =============================================================================
 # App meta / constants
 # =============================================================================
-APP_TITLE = "Goal Management System - Stanley Black & Decker"
+APP_TITLE = "目標管理アプリ - Stanley Black & Decker"
 
 BRAND_COLORS = {
     "primary": "#FFCC00",
@@ -654,8 +653,6 @@ def init_db() -> None:
     seed_admin_if_needed()
     seed_how_questions_if_needed()
 
-# app.py (Part 2/4)
-
 # =============================================================================
 # Auth / Session
 # =============================================================================
@@ -931,7 +928,7 @@ def section_title(title: str, icon: str = "📌") -> None:
 def header_bar(user: Optional[AuthUser]) -> None:
     st.markdown(
         '<div class="main-header">'
-        "<h1>🏭 Goal Management System</h1>"
+        "<h1>🏭 目標管理アプリ</h1>"
         "<p style='margin:5px 0 0 0;font-size:12px;'>Stanley Black & Decker</p>"
         "</div>",
         unsafe_allow_html=True,
@@ -972,26 +969,26 @@ def nav_sidebar(user: Optional[AuthUser]) -> None:
 
         if user.role == "入力者":
             st.markdown("**Employee Functions**")
-            st.button("📝 Goal Input", on_click=set_page, args=("goal_input",), use_container_width=True)
-            st.button("👁️ View Goals", on_click=set_page, args=("goal_view_self",), use_container_width=True)
-            st.button("⭐ Self Evaluation", on_click=set_page, args=("eval_input_self",), use_container_width=True)
-            st.button("📋 View Evaluations", on_click=set_page, args=("eval_view_self",), use_container_width=True)
-            st.button("🗣️ 1:1 Review", on_click=set_page, args=("oneonone_employee",), use_container_width=True)
-            st.button("📊 Approval Status", on_click=set_page, args=("approval_status_self",), use_container_width=True)
+            st.button("📝 目標入力", on_click=set_page, args=("goal_input",), use_container_width=True)
+            st.button("👁️ 目標確認", on_click=set_page, args=("goal_view_self",), use_container_width=True)
+            st.button("⭐ 自己評価", on_click=set_page, args=("eval_input_self",), use_container_width=True)
+            st.button("📋 評価確認", on_click=set_page, args=("eval_view_self",), use_container_width=True)
+            st.button("🗣️ 1on1 meeting日時確認", on_click=set_page, args=("oneonone_employee",), use_container_width=True)
+            st.button("📊 承認状況確認", on_click=set_page, args=("approval_status_self",), use_container_width=True)
 
         if user.role == "評価者":
             st.markdown("**Manager Functions**")
-            st.button("📂 View Team Goals", on_click=set_page, args=("goal_view_manager",), use_container_width=True)
-            st.button("✅ Approve Goals", on_click=set_page, args=("goal_approve_manager",), use_container_width=True)
-            st.button("⭐ Evaluate Team", on_click=set_page, args=("eval_input_manager",), use_container_width=True)
-            st.button("📅 Schedule 1:1", on_click=set_page, args=("oneonone_manager",), use_container_width=True)
+            st.button("📂 部下目標確認", on_click=set_page, args=("goal_view_manager",), use_container_width=True)
+            st.button("✅ 部下目標承認", on_click=set_page, args=("goal_approve_manager",), use_container_width=True)
+            st.button("⭐ 評価", on_click=set_page, args=("eval_input_manager",), use_container_width=True)
+            st.button("📅 1on1 meeting日時提案", on_click=set_page, args=("oneonone_manager",), use_container_width=True)
 
         if user.role == "HR管理者":
             st.markdown("**HR Admin Functions**")
             st.button("📈 HR Dashboard", on_click=set_page, args=("hr_dashboard",), use_container_width=True)
-            st.button("👥 Employee Master", on_click=set_page, args=("admin_employee_master",), use_container_width=True)
-            st.button("✔️ Confirm Goals (HR)", on_click=set_page, args=("goal_approve_hr",), use_container_width=True)
-            st.button("✔️ Confirm Evaluations (HR)", on_click=set_page, args=("eval_approve_hr",), use_container_width=True)
+            st.button("👥 従業員マスタ", on_click=set_page, args=("admin_employee_master",), use_container_width=True)
+            st.button("✔️ HR目標確認", on_click=set_page, args=("goal_approve_hr",), use_container_width=True)
+            st.button("✔️ HR評価確認", on_click=set_page, args=("eval_approve_hr",), use_container_width=True)
             st.button("📥 Export CSV", on_click=set_page, args=("admin_csv",), use_container_width=True)
 
         st.markdown("---")
@@ -1019,7 +1016,7 @@ def page_login() -> None:
     <div style="text-align:center;margin-bottom:30px;">
       <h1 style="color:{BRAND_COLORS['secondary']};margin:0 0 10px 0;">🏭</h1>
       <h2 style="color:{BRAND_COLORS['secondary']};margin:0 0 5px 0;font-size:24px;">Stanley Black & Decker</h2>
-      <p style="color:{BRAND_COLORS['dark_gray']};margin:0;font-size:14px;">Goal Management System</p>
+      <p style="color:{BRAND_COLORS['dark_gray']};margin:0;font-size:14px;">目標管理アプリ</p>
     </div>
 """,
         unsafe_allow_html=True,
@@ -1028,14 +1025,14 @@ def page_login() -> None:
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("login_form", clear_on_submit=False):
-            role: Role = st.selectbox("📋 Select Role:", ["入力者", "評価者", "HR管理者"], index=0)
+            role: Role = st.selectbox("📋 役割を選択してください:", ["入力者", "評価者", "HR管理者"], index=0)
             login_year = year_input_login(datetime.utcnow().year)
             emp_no = st.text_input("👤 Employee ID:", placeholder="Example: 000001")
             password = st.text_input("🔐 Password:", type="password")
-            submitted = st.form_submit_button("🔓 Sign In", use_container_width=True)
+            submitted = st.form_submit_button("🔓 ログイン", use_container_width=True)
 
         st.divider()
-        if st.button("❓ Forgot Password?", use_container_width=True):
+        if st.button("❓ パスワードを忘れた方はこちら", use_container_width=True):
             set_page("forgot_password")
 
     st.markdown("</div></div>", unsafe_allow_html=True)
@@ -1045,18 +1042,18 @@ def page_login() -> None:
 
     emp_no = emp_no.strip()
     if not emp_no or not password:
-        st.error("❌ Please enter Employee ID and Password.")
+        st.error("❌ Employee IDとPasswordを入力してください。")
         return
 
     with SessionLocal() as db:
         emp = db.execute(select(Employee).where(Employee.emp_no == emp_no, Employee.active.is_(True))).scalar_one_or_none()
         if not emp or not verify_password(password, emp.password_hash):
-            st.error("❌ Invalid Employee ID or Password.")
+            st.error("❌ Employee IDまたはPasswordが間違っています。")
             return
 
         role_flag = ROLE_TO_FLAG[role]
         if not bool(getattr(emp, role_flag)):
-            st.error("❌ You do not have permission for this role.")
+            st.error("❌ この役割でログインする権限がありません。")
             return
 
         emp.last_login_at = datetime.utcnow()
@@ -1067,8 +1064,8 @@ def page_login() -> None:
         set_auth(AuthUser(emp_no=emp.emp_no, name=emp.name, role=role, role_key=ROLE_TO_KEY[role]))
 
         if emp.must_change_password:
-            set_page("password_change")
-            st.warning("🔐 Password change required on first login.")
+            set_page("パスワードの変更")
+            st.warning("🔐 初回ログイン時はパスワードの変更が必要です。")
         else:
             set_page("home")
             st.success("✅ Welcome back!")
@@ -1077,8 +1074,8 @@ def page_login() -> None:
 
 
 def page_forgot_password() -> None:
-    section_title("Password Recovery", "🔐")
-    st.info("👨‍💼 Contact your administrator to reset your password.")
+    section_title("パスワードのリセット", "🔐")
+    st.info("👨‍💼 HR管理者にパスワードのリセットを依頼してください。")
     if st.button("🔙 Back to Login"):
         set_page("login")
         st.rerun()
@@ -1090,7 +1087,7 @@ def page_password_change() -> None:
         set_page("login")
         st.stop()
 
-    section_title("Change Password", "🔐")
+    section_title("パスワードの変更", "🔐")
 
     with st.form("pw_change", clear_on_submit=True):
         current = st.text_input("現在のパスワード", type="password")
@@ -1155,23 +1152,23 @@ def page_home() -> None:
         st.markdown("### 📝 Your Tasks")
         c1, c2 = st.columns(2)
         with c1:
-            st.button("📝 Input Goals", use_container_width=True, on_click=set_page, args=("goal_input",))
-            st.button("⭐ Self Evaluation", use_container_width=True, on_click=set_page, args=("eval_input_self",))
-            st.button("📊 Status Check", use_container_width=True, on_click=set_page, args=("approval_status_self",))
+            st.button("📝 目標入力", use_container_width=True, on_click=set_page, args=("goal_input",))
+            st.button("⭐ 自己評価", use_container_width=True, on_click=set_page, args=("eval_input_self",))
+            st.button("📊 承認状況確認", use_container_width=True, on_click=set_page, args=("approval_status_self",))
         with c2:
-            st.button("👁️ View Goals", use_container_width=True, on_click=set_page, args=("goal_view_self",))
-            st.button("📋 View Evaluations", use_container_width=True, on_click=set_page, args=("eval_view_self",))
-            st.button("🗣️ 1:1 Review", use_container_width=True, on_click=set_page, args=("oneonone_employee",))
+            st.button("👁️ 目標確認", use_container_width=True, on_click=set_page, args=("goal_view_self",))
+            st.button("📋 評価確認", use_container_width=True, on_click=set_page, args=("eval_view_self",))
+            st.button("🗣️ 1on1 meetingの日時確認", use_container_width=True, on_click=set_page, args=("oneonone_employee",))
 
     if user.role == "評価者":
         st.markdown("### 👥 Team Management")
         c1, c2 = st.columns(2)
         with c1:
-            st.button("📂 View Team Goals", use_container_width=True, on_click=set_page, args=("goal_view_manager",))
-            st.button("⭐ Evaluate Team", use_container_width=True, on_click=set_page, args=("eval_input_manager",))
+            st.button("📂 部下目標確認", use_container_width=True, on_click=set_page, args=("goal_view_manager",))
+            st.button("⭐ 評価", use_container_width=True, on_click=set_page, args=("eval_input_manager",))
         with c2:
-            st.button("✅ Approve Goals", use_container_width=True, on_click=set_page, args=("goal_approve_manager",))
-            st.button("📅 Schedule 1:1", use_container_width=True, on_click=set_page, args=("oneonone_manager",))
+            st.button("✅ 部下目標承認", use_container_width=True, on_click=set_page, args=("goal_approve_manager",))
+            st.button("📅 1on1 meeting日時提案", use_container_width=True, on_click=set_page, args=("oneonone_manager",))
 
     if user.role == "HR管理者":
         st.markdown("### ⚙️ HR Administration")
@@ -1179,17 +1176,15 @@ def page_home() -> None:
         with c1:
             st.button("📈 HR Dashboard", use_container_width=True, on_click=set_page, args=("hr_dashboard",))
         with c2:
-            st.button("👥 Employee Master", use_container_width=True, on_click=set_page, args=("admin_employee_master",))
+            st.button("👥 従業員マスタ", use_container_width=True, on_click=set_page, args=("admin_employee_master",))
         with c3:
             st.button("📥 Export CSV", use_container_width=True, on_click=set_page, args=("admin_csv",))
 
         c4, c5 = st.columns(2)
         with c4:
-            st.button("✔️ Approve Goals (HR)", use_container_width=True, on_click=set_page, args=("goal_approve_hr",))
+            st.button("✔️ HR目標確認", use_container_width=True, on_click=set_page, args=("goal_approve_hr",))
         with c5:
-            st.button("✔️ Approve Evaluations (HR)", use_container_width=True, on_click=set_page, args=("eval_approve_hr",))
-
-# app.py (Part 3/4)
+            st.button("✔️ HR評価確認", use_container_width=True, on_click=set_page, args=("eval_approve_hr",))
 
 # =============================================================================
 # Admin: Employee Master
@@ -1215,11 +1210,10 @@ def _csv_template_text() -> str:
 
 def page_admin_employee_master() -> None:
     require_role("HR管理者")
-    section_title("Employee Master Management", "👥")
+    section_title("従業員マスタ管理", "👥")
 
     st.markdown("### CSV Upload")
     st.caption(
-        "列: emp_no,name,department,email,active,role_admin,role_manager,role_employee,manager_emp_no,password\n"
         "※ password空欄の場合は ChangeMe_1234 を自動セット（次回ログイン時変更は必須）"
     )
 
@@ -1522,7 +1516,7 @@ def load_or_create_goal(db, emp_no: str, year: int) -> Goal:
 
 def page_goal_input() -> None:
     user = require_role("入力者")
-    section_title("Goal Input", "🎣")
+    section_title("目標入力", "🎣")
     year = get_selected_year()
 
     def _ensure_state(goal: Goal) -> str:
@@ -2010,7 +2004,7 @@ def page_goal_approve_manager() -> None:
 
 def page_goal_approve_hr() -> None:
     user = require_role("HR管理者")
-    section_title("Confirm Goals (HR)", "✔️")
+    section_title("HR目標確認", "✔️")
     year = get_selected_year()
 
     with SessionLocal() as db:
@@ -2074,14 +2068,12 @@ def page_goal_approve_hr() -> None:
             st.warning("差し戻しました（社員が修正→再Submit）。")
             st.rerun()
 
-# app.py (Part 4/4)
-
 # =============================================================================
 # Evaluation: pages (Self / Manager / HR)
 # =============================================================================
 def page_eval_input_self() -> None:
     user = require_role("入力者")
-    section_title("Self Evaluation", "⭐")
+    section_title("自己評価", "⭐")
     year = get_selected_year()
 
     with SessionLocal() as db:
@@ -2132,7 +2124,6 @@ def page_eval_input_self() -> None:
         st.info(f"what（自己）プレビュー: {what}（平均 {pct:.1f}%）")
 
         st.markdown("---")
-        # ✅ FIX: 元コードで壊れていた st.markdown 行（構文エラー）を正常化
         st.markdown("### how（8カテゴリ×5問 / 1〜4点）")
 
         questions = db.execute(select(HowQuestion).where(HowQuestion.active.is_(True))).scalars().all()
@@ -2238,7 +2229,7 @@ def page_eval_input_self() -> None:
 
 def page_eval_view_self() -> None:
     user = require_role("入力者")
-    section_title("My Evaluations", "📋")
+    section_title("評価確認", "📋")
     year = get_selected_year()
 
     with SessionLocal() as db:
@@ -2262,7 +2253,7 @@ def page_eval_view_self() -> None:
 
 def page_eval_input_manager() -> None:
     user = require_role("評価者")
-    section_title("Evaluate Team Members", "⭐")
+    section_title("評価", "⭐")
     year = get_selected_year()
 
     with SessionLocal() as db:
@@ -2410,7 +2401,7 @@ def page_eval_input_manager() -> None:
 
 def page_eval_approve_hr() -> None:
     user = require_role("HR管理者")
-    section_title("Confirm Evaluations (HR)", "✔️")
+    section_title("HR評価確認", "✔️")
     year = get_selected_year()
 
     with SessionLocal() as db:
@@ -2499,7 +2490,7 @@ def page_eval_approve_hr() -> None:
 # =============================================================================
 def page_oneonone_manager() -> None:
     user = require_role("評価者")
-    section_title("Schedule 1:1 Meeting", "📅")
+    section_title(" 1 on 1 Meetingの設定", "📅")
     year = get_selected_year()
 
     with SessionLocal() as db:
@@ -2570,7 +2561,7 @@ def page_oneonone_manager() -> None:
 
 def page_oneonone_employee() -> None:
     user = require_role("入力者")
-    section_title("1:1 Review (Employee)", "🗣️")
+    section_title("1on1 Meeting 日時確認", "🗣️")
     year = get_selected_year()
 
     with SessionLocal() as db:
@@ -2621,7 +2612,7 @@ def page_oneonone_employee() -> None:
 # =============================================================================
 def page_approval_status_self() -> None:
     user = require_role("入力者")
-    section_title("Approval Status", "📊")
+    section_title("承認状況確認", "📊")
     year = get_selected_year()
 
     with SessionLocal() as db:
