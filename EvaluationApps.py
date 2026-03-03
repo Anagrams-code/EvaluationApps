@@ -956,11 +956,11 @@ def nav_sidebar(user: Optional[AuthUser]) -> None:
         )
 
         if not user:
-            st.warning("⚠️ Please log in to access the system.")
+            st.warning("⚠️ アプリにログインしてください.")
             return
 
         if get_page() == "password_change":
-            st.info("🔐 Password change required before continuing.")
+            st.info("🔐 初回ログイン時はパスワード変更が必要です。")
             return
 
         st.markdown(f"**年度（ログイン時指定）:** {get_selected_year()}")
