@@ -956,7 +956,7 @@ def nav_sidebar(user: Optional[AuthUser]) -> None:
         )
 
         if not user:
-            st.warning("⚠️ アプリにログインしてください.")
+            st.warning("⚠️ アプリにログインしてください。")
             return
 
         if get_page() == "password_change":
