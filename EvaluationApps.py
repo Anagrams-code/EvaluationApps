@@ -1064,7 +1064,7 @@ def page_login() -> None:
         set_auth(AuthUser(emp_no=emp.emp_no, name=emp.name, role=role, role_key=ROLE_TO_KEY[role]))
 
         if emp.must_change_password:
-            set_page("パスワードの変更")
+            set_page("password_change")
             st.warning("🔐 初回ログイン時はパスワードの変更が必要です。")
         else:
             set_page("home")
