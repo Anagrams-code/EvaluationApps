@@ -1176,7 +1176,7 @@ def page_home() -> None:
             st.button("📂 部下目標確認", use_container_width=True, on_click=set_page, args=("goal_view_manager",))
             st.button("⭐ 評価", use_container_width=True, on_click=set_page, args=("eval_input_manager",))
         with c2:
-            st.button("✅ 部下目標承認", use_container_width=True, on_click=set_page, args=("goal_approve_manager",))
+            st.button("📋 承認申請一覧", use_container_width=True, on_click=set_page, args=("approval_list_manager",))
             st.button("📅 1on1 meeting日時提案", use_container_width=True, on_click=set_page, args=("oneonone_manager",))
 
     if user.role == "HR管理者":
