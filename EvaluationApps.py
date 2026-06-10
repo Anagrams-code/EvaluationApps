@@ -988,7 +988,7 @@ def nav_sidebar(user: Optional[AuthUser]) -> None:
         if user.role == "評価者":
             st.markdown("**Manager Functions**")
             st.button("📂 部下目標確認", on_click=set_page, args=("goal_view_manager",), use_container_width=True)
-            st.button("✅ 部下目標承認", on_click=set_page, args=("goal_approve_manager",), use_container_width=True)
+            st.button("📋 承認申請一覧", on_click=set_page, args=("approval_list_manager",), use_container_width=True)
             st.button("⭐ 評価", on_click=set_page, args=("eval_input_manager",), use_container_width=True)
             st.button("📅 1on1 meeting日時提案", on_click=set_page, args=("oneonone_manager",), use_container_width=True)
 
@@ -1737,34 +1737,9 @@ def page_goal_input() -> None:
         st.caption(f"年度: {year} / 状態: {status_label_goal(goal.status)}")
 
         if goal.status == "hr_approved":
-            if emp.manager_emp_no:
-                if st.button("目標修正を依頼", use_container_width=True, key=f"request_edit_{user.emp_no}_{year}"):
-                    goal.status = "hr_edit_requested"
-                    db.add(
-                        GoalApproval(
-                            goal_id=goal.id,
-                            stage="employee",
-                            action="request_edit",
-                            comment="HR確認後の修正依頼",
-                            actor_emp_no=user.emp_no,
-                        )
-                    )
-                    db.commit()
-                    manager = db.execute(select(Employee).where(Employee.emp_no == emp.manager_emp_no)).scalar_one_or_none()
-                    if manager and manager.email:
-                        subject = f"【目標管理】{user.name}さんが目標修正を依頼しました（{year}年度）"
-                        body = (
-                            "こんにちは、\n\n"
-                            f"{user.name}さんが{year}年度の目標について修正を希望しています。\n"
-                            "修正承認をお願いいたします。\n\n---\n本メールは自動送信されています。"
-                        )
-                        send_email(manager.email, subject, body)
-                    st.success("上長へ修正依頼を送信しました。")
-                    st.rerun()
-            else:
-                st.warning("上長が設定されていないため、修正依頼できません。")
+            st.info("✅ 目標が公開（確定）されました。修正が必要な場合は下記の「修正依頼」ボタンをクリックしてください。")
         elif goal.status == "hr_edit_requested":
-            st.info("上長の修正承認待ちです。")
+            st.info("📋 上長の修正承認待ちです。")
 
         editable = can_edit_goal(goal.status)
 
@@ -1775,13 +1750,41 @@ def page_goal_input() -> None:
         _render_development_form(state_key, editable=editable)
 
         st.markdown("---")
-        c1, c2, c3 = st.columns([1, 1, 2])
+        c1, c2, c3, c4 = st.columns([1, 1.2, 1, 1.8])
         with c1:
             save = st.button("保存（下書き）", disabled=not editable, use_container_width=True)
         with c2:
             submit = st.button("上長へ承認依頼（Submit）", disabled=not editable, use_container_width=True)
         with c3:
+            request_edit = False
+            if goal.status == "hr_approved" and emp.manager_emp_no:
+                request_edit = st.button("📋 修正依頼", use_container_width=True)
+        with c4:
             st.caption("Submitすると「上長承認待ち」になります（差戻し時は再編集可）。")
+
+        if request_edit:
+            goal.status = "hr_edit_requested"
+            db.add(
+                GoalApproval(
+                    goal_id=goal.id,
+                    stage="employee",
+                    action="request_edit",
+                    comment="HR確認後の修正依頼",
+                    actor_emp_no=user.emp_no,
+                )
+            )
+            db.commit()
+            manager = db.execute(select(Employee).where(Employee.emp_no == emp.manager_emp_no)).scalar_one_or_none()
+            if manager and manager.email:
+                subject = f"【目標管理】{user.name}さんが目標修正を依頼しました（{year}年度）"
+                body = (
+                    "こんにちは、\n\n"
+                    f"{user.name}さんが{year}年度の目標について修正を希望しています。\n"
+                    "修正承認をお願いいたします。\n\n---\n本メールは自動送信されています。"
+                )
+                send_email(manager.email, subject, body)
+            st.success("上長へ修正依頼を送信しました。")
+            st.rerun()
 
         if not (save or submit):
             return
@@ -1995,92 +1998,101 @@ def page_goal_approve_manager() -> None:
 
         candidates = db.execute(
             select(Goal)
-            .where(Goal.year == year, Goal.employee_emp_no.in_(sub_emp_nos), Goal.status.in_(["submitted", "hr_edit_requested"]))
+            .where(Goal.year == year, Goal.employee_emp_no.in_(sub_emp_nos), Goal.status == "submitted")
             .order_by(Goal.updated_at.desc())
         ).scalars().all()
         if not candidates:
             st.info("承認待ちの目標がありません。")
             return
 
-        st.markdown("### 承認待ち目標一覧")
+        st.markdown("### 承認待ち目標一覧（新規申請）")
         selected_goals = []
         for goal in candidates:
             emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
             label = f"{goal.employee_emp_no} {emp_target.name if emp_target else ''} | {status_label_goal(goal.status)} | 更新 {goal.updated_at:%Y-%m-%d}"
-            with st.expander(label, expanded=False):
-                items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
-                st.markdown("#### 目標内容")
-                for it in items:
-                    if it.type == "business":
-                        st.write(f"**①今回の対象となる業務**: {it.specific}")
-                        st.write(f"**②達成したい結果**: {it.measurable}")
-                        st.write(f"**③期限**: {_fmt_date(it.deadline_date)}")
-                        st.write(f"**④部署ゴールとの関連性**: {it.relevant}")
-                        st.write(f"**実行計画(任意)**: {it.achievable}")
-                    else:
-                        st.write(f"**①なりたい人物像/身につけたいスキル**: {it.career_vision}")
-                        st.write(f"**②現在の自分とのギャップ**: {it.specific}")
-                        st.write(f"**③どのような行動を行いますか？**: {it.measurable}")
-                        st.write(f"**実行計画(任意)**: {it.achievable}")
-                        st.write(f"**完了時期(任意)**: {_fmt_date(it.deadline_date)}")
+            
+            # チェックボックスを左側に配置
+            col_check, col_expand = st.columns([0.08, 0.92])
+            with col_check:
+                selected = st.checkbox("", key=f"gm_selected:{goal.id}", label_visibility="collapsed")
+            
+            with col_expand:
+                with st.expander(label, expanded=selected):
+                    items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
+                    st.markdown("#### 目標内容")
+                    for it in items:
+                        if it.type == "business":
+                            st.write(f"**①今回の対象となる業務**: {it.specific}")
+                            st.write(f"**②達成したい結果**: {it.measurable}")
+                            st.write(f"**③期限**: {_fmt_date(it.deadline_date)}")
+                            st.write(f"**④部署ゴールとの関連性**: {it.relevant}")
+                            st.write(f"**実行計画(任意)**: {it.achievable}")
+                        else:
+                            st.write(f"**①なりたい人物像/身につけたいスキル**: {it.career_vision}")
+                            st.write(f"**②現在の自分とのギャップ**: {it.specific}")
+                            st.write(f"**③どのような行動を行いますか？**: {it.measurable}")
+                            st.write(f"**実行計画(任意)**: {it.achievable}")
+                            st.write(f"**完了時期(任意)**: {_fmt_date(it.deadline_date)}")
 
-                selected = st.checkbox("一括処理対象", key=f"gm_selected:{goal.id}")
-                if not selected:
-                    continue
-                if goal.status == "submitted":
-                    action = st.selectbox(
-                        "処理",
-                        ["承認（HRへ提出）", "差し戻し（社員へ）"],
-                        key=f"gm_action:{goal.id}",
-                    )
-                else:
-                    action = st.selectbox(
-                        "処理",
-                        ["修正許可（編集解放）", "非承認（ロック継続）"],
-                        key=f"gm_action:{goal.id}",
-                    )
-                comment = st.text_area("コメント", value="", key=f"gm_comment:{goal.id}", height=120)
-                selected_goals.append((goal, action, comment))
+                    if selected:
+                        st.markdown("#### 処理選択")
+                        col_approve, col_reject = st.columns(2)
+                        with col_approve:
+                            if st.button("✅ 承認（HRへ提出）", key=f"gm_approve:{goal.id}", use_container_width=True):
+                                selected_goals.append((goal, "承認（HRへ提出）", ""))
+                        with col_reject:
+                            if st.button("❌ 差し戻し（社員へ）", key=f"gm_reject:{goal.id}", use_container_width=True):
+                                st.session_state[f"gm_comment_mode:{goal.id}"] = True
+                        
+                        if st.session_state.get(f"gm_comment_mode:{goal.id}", False):
+                            comment = st.text_area("差し戻し理由（必須）", value="", key=f"gm_comment:{goal.id}", height=120)
+                            if st.button("差し戻し確定", key=f"gm_confirm_reject:{goal.id}", use_container_width=True):
+                                if comment.strip():
+                                    selected_goals.append((goal, "差し戻し（社員へ）", comment))
+                                    st.session_state[f"gm_comment_mode:{goal.id}"] = False
+                                    st.rerun()
+                                else:
+                                    st.error("差し戻し理由を入力してください。")
 
         if not selected_goals:
-            st.info("処理する目標を選択してください。")
+            st.warning("処理する項目を選択してください。")
+            st.info("各目標の詳細を開き、「承認」または「差し戻し」ボタンをクリックしてください。")
             return
 
-        if st.button("選択した目標を一括処理", use_container_width=True):
-            for goal, action, comment in selected_goals:
-                if action in {"差し戻し（社員へ）", "非承認（ロック継続）"} and not comment.strip():
-                    st.error("非承認/差し戻しにはコメントが必須です。")
-                    st.stop()
+        st.markdown("### 処理内容確認")
+        st.write(f"**処理対象数**: {len(selected_goals)}件")
+        
+        col_approve, col_reject = st.columns(2)
+        with col_approve:
+            if st.button("✅ 一括確定", use_container_width=True):
+                for goal, action, comment in selected_goals:
+                    if action in {"差し戻し（社員へ）", "非承認（ロック継続）"} and not comment.strip():
+                        st.error("非承認/差し戻しにはコメントが必須です。")
+                        st.stop()
 
-            for goal, action, comment in selected_goals:
-                if action == "承認（HRへ提出）":
-                    goal.status = "manager_approved"
-                    db.add(GoalApproval(goal_id=goal.id, stage="manager", action="approve", comment="", actor_emp_no=user.emp_no))
-                    hr_admins = db.execute(select(Employee).where(Employee.role_admin.is_(True))).scalars().all()
-                    emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
-                    subject = f"【目標管理】{emp_target.name if emp_target else ''}さんの目標が上長承認されました"
-                    body = (
-                        "こんにちは,\n\n"
-                        f"{emp_target.name if emp_target else ''}さんの{goal.year}年度の目標が上長（{user.name}さん）に承認されました。\n"
-                        "確認をお願いいたします。\n\n---\n本メールは自動送信されています。"
-                    )
-                    for hr in hr_admins:
-                        if hr.email:
-                            send_email(hr.email, subject, body)
-                elif action == "差し戻し（社員へ）":
-                    goal.status = "manager_returned"
-                    db.add(GoalApproval(goal_id=goal.id, stage="manager", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
-                elif action == "修正許可（編集解放）":
-                    goal.status = "manager_returned"
-                    db.add(GoalApproval(goal_id=goal.id, stage="manager", action="approve_edit", comment=comment.strip(), actor_emp_no=user.emp_no))
-                else:
-                    goal.status = "hr_approved"
-                    db.add(GoalApproval(goal_id=goal.id, stage="manager", action="reject_edit", comment=comment.strip(), actor_emp_no=user.emp_no))
-                db.add(goal)
+                for goal, action, comment in selected_goals:
+                    if action == "承認（HRへ提出）":
+                        goal.status = "manager_approved"
+                        db.add(GoalApproval(goal_id=goal.id, stage="manager", action="approve", comment="", actor_emp_no=user.emp_no))
+                        hr_admins = db.execute(select(Employee).where(Employee.role_admin.is_(True))).scalars().all()
+                        emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
+                        subject = f"【目標管理】{emp_target.name if emp_target else ''}さんの目標が上長承認されました"
+                        body = (
+                            "こんにちは,\n\n"
+                            f"{emp_target.name if emp_target else ''}さんの{goal.year}年度の目標が上長（{user.name}さん）に承認されました。\n"
+                            "確認をお願いいたします。\n\n---\n本メールは自動送信されています。"
+                        )
+                        for hr in hr_admins:
+                            if hr.email:
+                                send_email(hr.email, subject, body)
+                    elif action == "差し戻し（社員へ）":
+                        goal.status = "manager_returned"
+                        db.add(GoalApproval(goal_id=goal.id, stage="manager", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
+                    db.add(goal)
 
-            db.commit()
-            st.success("選択した目標を処理しました。")
-            st.rerun()
+                db.commit()
+                st.success("選択した目標を処理しました。")
+                st.rerun()
 
 
 def page_goal_approve_hr() -> None:
@@ -2101,6 +2113,329 @@ def page_goal_approve_hr() -> None:
         for goal in candidates:
             emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
             label = f"{goal.employee_emp_no} {emp_target.name if emp_target else ''} | 更新 {goal.updated_at:%Y-%m-%d}"
+            
+            # チェックボックスを左側に配置
+            col_check, col_expand = st.columns([0.08, 0.92])
+            with col_check:
+                selected = st.checkbox("", key=f"gh_selected:{goal.id}", label_visibility="collapsed")
+            
+            with col_expand:
+                with st.expander(label, expanded=selected):
+                    items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
+                    st.markdown("#### 目標内容")
+                    for it in items:
+                        if it.type == "business":
+                            st.write(f"**①今回の対象となる業務**: {it.specific}")
+                            st.write(f"**②達成したい結果**: {it.measurable}")
+                            st.write(f"**③期限**: {_fmt_date(it.deadline_date)}")
+                            st.write(f"**④部署ゴールとの関連性**: {it.relevant}")
+                            st.write(f"**実行計画(任意)**: {it.achievable}")
+                        else:
+                            st.write(f"**①なりたい人物像/身につけたいスキル**: {it.career_vision}")
+                            st.write(f"**②現在の自分とのギャップ**: {it.specific}")
+                            st.write(f"**③どのような行動を行いますか？**: {it.measurable}")
+                            st.write(f"**実行計画(任意)**: {it.achievable}")
+                            st.write(f"**完了時期(任意)**: {_fmt_date(it.deadline_date)}")
+
+                    if selected:
+                        st.markdown("#### 処理選択")
+                        col_approve, col_reject = st.columns(2)
+                        with col_approve:
+                            if st.button("✅ 公開（承認）", key=f"gh_approve:{goal.id}", use_container_width=True):
+                                selected_goals.append((goal, "公開（承認）", ""))
+                        with col_reject:
+                            if st.button("❌ 差し戻し（社員へ）", key=f"gh_reject:{goal.id}", use_container_width=True):
+                                st.session_state[f"gh_comment_mode:{goal.id}"] = True
+                        
+                        if st.session_state.get(f"gh_comment_mode:{goal.id}", False):
+                            comment = st.text_area("差し戻し理由（必須）", value="", key=f"gh_comment:{goal.id}", height=120)
+                            if st.button("差し戻し確定", key=f"gh_confirm_reject:{goal.id}", use_container_width=True):
+                                if comment.strip():
+                                    selected_goals.append((goal, "差し戻し（社員へ）", comment))
+                                    st.session_state[f"gh_comment_mode:{goal.id}"] = False
+                                    st.rerun()
+                                else:
+                                    st.error("差し戻し理由を入力してください。")
+
+        if not selected_goals:
+            st.warning("処理する項目を選択してください。")
+            st.info("各目標の詳細を開き、「公開（承認）」または「差し戻し」ボタンをクリックしてください。")
+            return
+
+        st.markdown("### 処理内容確認")
+        st.write(f"**処理対象数**: {len(selected_goals)}件")
+        
+        col_approve, col_reject = st.columns(2)
+        with col_approve:
+            if st.button("✅ 一括確定", use_container_width=True):
+                for goal, action, comment in selected_goals:
+                    if action == "差し戻し（社員へ）" and not comment.strip():
+                        st.error("差し戻し時はコメントが必須です。")
+                        st.stop()
+
+            for goal, action, comment in selected_goals:
+                if action == "公開（承認）":
+                    goal.status = "hr_approved"
+                    db.add(GoalApproval(goal_id=goal.id, stage="hr", action="approve", comment=comment.strip(), actor_emp_no=user.emp_no))
+                else:
+                    goal.status = "hr_returned"
+                    db.add(GoalApproval(goal_id=goal.id, stage="hr", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
+                db.add(goal)
+
+            db.commit()
+            st.success("選択した目標を処理しました。")
+            st.rerun()
+
+
+def page_approval_list_manager() -> None:
+    user = require_role("評価者")
+    st.subheader("承認申請一覧（上長）")
+    year = get_selected_year()
+
+    with SessionLocal() as db:
+        subs = db.execute(select(Employee).where(Employee.manager_emp_no == user.emp_no, Employee.active.is_(True))).scalars().all()
+        if not subs:
+            st.info("部下がいません。")
+            return
+
+        sub_emp_nos = [e.emp_no for e in subs]
+
+        # 1. 目標承認申請（新規）
+        goal_approvals = db.execute(
+            select(Goal)
+            .where(Goal.year == year, Goal.employee_emp_no.in_(sub_emp_nos), Goal.status == "submitted")
+            .order_by(Goal.updated_at.desc())
+        ).scalars().all()
+
+        # 2. 修正承認申請
+        edit_requests = db.execute(
+            select(Goal)
+            .where(Goal.year == year, Goal.employee_emp_no.in_(sub_emp_nos), Goal.status == "hr_edit_requested")
+            .order_by(Goal.updated_at.desc())
+        ).scalars().all()
+
+        # 3. 評価承認申請
+        eval_approvals = db.execute(
+            select(Evaluation)
+            .where(Evaluation.year == year, Evaluation.employee_emp_no.in_(sub_emp_nos), Evaluation.status == "manager_submitted")
+            .order_by(Evaluation.updated_at.desc())
+        ).scalars().all()
+
+        has_requests = bool(goal_approvals or edit_requests or eval_approvals)
+        if not has_requests:
+            st.info("承認申請がありません。")
+            return
+
+        # ===== 目標承認申請 =====
+        if goal_approvals:
+            st.markdown("## 📝 目標承認申請")
+            st.markdown(f"申請数: **{len(goal_approvals)}件**")
+            
+            for goal in goal_approvals:
+                emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
+                label = f"{goal.employee_emp_no} {emp_target.name if emp_target else ''} | {goal.updated_at:%Y-%m-%d}"
+                
+                with st.expander(label, expanded=False):
+                    items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
+                    st.markdown("#### 目標内容")
+                    for it in items:
+                        if it.type == "business":
+                            st.write(f"**①今回の対象となる業務**: {it.specific}")
+                            st.write(f"**②達成したい結果**: {it.measurable}")
+                            st.write(f"**③期限**: {_fmt_date(it.deadline_date)}")
+                            st.write(f"**④部署ゴールとの関連性**: {it.relevant}")
+                            st.write(f"**実行計画(任意)**: {it.achievable}")
+                        else:
+                            st.write(f"**①なりたい人物像/身につけたいスキル**: {it.career_vision}")
+                            st.write(f"**②現在の自分とのギャップ**: {it.specific}")
+                            st.write(f"**③どのような行動を行いますか？**: {it.measurable}")
+                            st.write(f"**実行計画(任意)**: {it.achievable}")
+                            st.write(f"**完了時期(任意)**: {_fmt_date(it.deadline_date)}")
+
+                    st.markdown("#### 処理選択")
+                    col_approve, col_reject = st.columns(2)
+                    with col_approve:
+                        if st.button("✅ 承認（HRへ提出）", key=f"gm_approve:{goal.id}", use_container_width=True):
+                            selected_goals = [(goal, "承認（HRへ提出）", "")]
+                            for sel_goal, action, comment in selected_goals:
+                                if action == "承認（HRへ提出）":
+                                    sel_goal.status = "manager_approved"
+                                    db.add(GoalApproval(goal_id=sel_goal.id, stage="manager", action="approve", comment="", actor_emp_no=user.emp_no))
+                                    hr_admins = db.execute(select(Employee).where(Employee.role_admin.is_(True))).scalars().all()
+                                    emp_t = db.execute(select(Employee).where(Employee.emp_no == sel_goal.employee_emp_no)).scalar_one_or_none()
+                                    subject = f"【目標管理】{emp_t.name if emp_t else ''}さんの目標が上長承認されました"
+                                    body = f"こんにちは,\n\n{emp_t.name if emp_t else ''}さんの{year}年度の目標が上長（{user.name}さん）に承認されました。\n確認をお願いいたします。\n\n---\n本メールは自動送信されています。"
+                                    for hr in hr_admins:
+                                        if hr.email:
+                                            send_email(hr.email, subject, body)
+                                db.add(sel_goal)
+                            db.commit()
+                            st.success("承認しました。")
+                            st.rerun()
+                    
+                    with col_reject:
+                        if st.button("❌ 差し戻し（社員へ）", key=f"gm_reject:{goal.id}", use_container_width=True):
+                            st.session_state[f"gm_comment_mode:{goal.id}"] = True
+                    
+                    if st.session_state.get(f"gm_comment_mode:{goal.id}", False):
+                        comment = st.text_area("差し戻し理由（必須）", value="", key=f"gm_comment:{goal.id}", height=100)
+                        if st.button("差し戻し確定", key=f"gm_confirm_reject:{goal.id}", use_container_width=True):
+                            if comment.strip():
+                                goal.status = "manager_returned"
+                                db.add(GoalApproval(goal_id=goal.id, stage="manager", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
+                                db.add(goal)
+                                db.commit()
+                                st.success("差し戻しました。")
+                                st.rerun()
+                            else:
+                                st.error("差し戻し理由を入力してください。")
+            
+            st.markdown("---")
+
+        # ===== 評価承認申請 =====
+        if eval_approvals:
+            st.markdown("## ⭐ 評価承認申請")
+            st.markdown(f"申請数: **{len(eval_approvals)}件**")
+            
+            for evaluation in eval_approvals:
+                emp_target = db.execute(select(Employee).where(Employee.emp_no == evaluation.employee_emp_no)).scalar_one_or_none()
+                label = f"{evaluation.employee_emp_no} {emp_target.name if emp_target else ''} | {evaluation.updated_at:%Y-%m-%d}"
+                
+                with st.expander(label, expanded=False):
+                    goal = db.execute(select(Goal).where(Goal.id == evaluation.goal_id)).scalar_one()
+                    items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id)).scalars().all()
+                    biz = [it for it in items if it.type == "business"]
+                    pct, what_auto = calc_what_from_business(biz)
+                    
+                    st.write(f"**what**: 自己={evaluation.what_self} / 上長={evaluation.what_manager} / 自動={what_auto}（平均 {pct:.1f}%）")
+                    st.write(f"**how**: 自己={evaluation.how_self} / 上長={evaluation.how_manager}")
+                    st.write(f"**自己コメント**: {evaluation.self_comment}")
+                    st.write(f"**上長コメント**: {evaluation.manager_comment}")
+
+                    st.markdown("#### 処理選択")
+                    col_approve, col_reject = st.columns(2)
+                    with col_approve:
+                        if st.button("✅ 承認（HRへ提出）", key=f"em_approve:{evaluation.id}", use_container_width=True):
+                            evaluation.status = "manager_submitted"
+                            db.add(EvaluationApproval(evaluation_id=evaluation.id, stage="manager", action="approve", comment="", actor_emp_no=user.emp_no))
+                            db.add(evaluation)
+                            db.commit()
+                            st.success("承認しました。")
+                            st.rerun()
+                    
+                    with col_reject:
+                        if st.button("❌ 差し戻し（社員へ）", key=f"em_reject:{evaluation.id}", use_container_width=True):
+                            st.session_state[f"em_comment_mode:{evaluation.id}"] = True
+                    
+                    if st.session_state.get(f"em_comment_mode:{evaluation.id}", False):
+                        comment = st.text_area("差し戻し理由（必須）", value="", key=f"em_comment:{evaluation.id}", height=100)
+                        if st.button("差し戻し確定", key=f"em_confirm_reject:{evaluation.id}", use_container_width=True):
+                            if comment.strip():
+                                evaluation.status = "manager_returned"
+                                db.add(EvaluationApproval(evaluation_id=evaluation.id, stage="manager", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
+                                db.add(evaluation)
+                                db.commit()
+                                st.success("差し戻しました。")
+                                st.rerun()
+                            else:
+                                st.error("差し戻し理由を入力してください。")
+            
+            st.markdown("---")
+
+        # ===== 修正承認申請 =====
+        if edit_requests:
+            st.markdown("## 📋 目標修正承認申請")
+            st.markdown(f"申請数: **{len(edit_requests)}件**")
+            
+            for goal in edit_requests:
+                emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
+                label = f"{goal.employee_emp_no} {emp_target.name if emp_target else ''} | {goal.updated_at:%Y-%m-%d}"
+                
+                with st.expander(label, expanded=False):
+                    items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
+                    st.markdown("#### 目標内容")
+                    for it in items:
+                        if it.type == "business":
+                            st.write(f"**①今回の対象となる業務**: {it.specific}")
+                            st.write(f"**②達成したい結果**: {it.measurable}")
+                            st.write(f"**③期限**: {_fmt_date(it.deadline_date)}")
+                            st.write(f"**④部署ゴールとの関連性**: {it.relevant}")
+                            st.write(f"**実行計画(任意)**: {it.achievable}")
+                        else:
+                            st.write(f"**①なりたい人物像/身につけたいスキル**: {it.career_vision}")
+                            st.write(f"**②現在の自分とのギャップ**: {it.specific}")
+                            st.write(f"**③どのような行動を行いますか？**: {it.measurable}")
+                            st.write(f"**実行計画(任意)**: {it.achievable}")
+                            st.write(f"**完了時期(任意)**: {_fmt_date(it.deadline_date)}")
+
+                    st.markdown("#### 処理選択")
+                    col_approve, col_reject = st.columns(2)
+                    with col_approve:
+                        if st.button("✅ 修正を許可（編集解放）", key=f"ge_approve:{goal.id}", use_container_width=True):
+                            goal.status = "manager_returned"
+                            db.add(GoalApproval(goal_id=goal.id, stage="manager", action="approve_edit", comment="修正を許可しました", actor_emp_no=user.emp_no))
+                            db.add(goal)
+                            db.commit()
+                            emp_t = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
+                            if emp_t and emp_t.email:
+                                subject = f"【目標管理】目標の修正が承認されました（{year}年度）"
+                                body = f"こんにちは、\n\n申請いただいた{year}年度の目標の修正が承認されました。\n編集画面で修正を進めてください。\n\n---\n本メールは自動送信されています。"
+                                send_email(emp_t.email, subject, body)
+                            st.success("修正を許可しました。")
+                            st.rerun()
+                    
+                    with col_reject:
+                        if st.button("❌ 修正を却下（ロック継続）", key=f"ge_reject:{goal.id}", use_container_width=True):
+                            st.session_state[f"ge_comment_mode:{goal.id}"] = True
+                    
+                    if st.session_state.get(f"ge_comment_mode:{goal.id}", False):
+                        comment = st.text_area("却下理由（必須）", value="", key=f"ge_comment:{goal.id}", height=100)
+                        if st.button("却下確定", key=f"ge_confirm_reject:{goal.id}", use_container_width=True):
+                            if comment.strip():
+                                goal.status = "hr_approved"
+                                db.add(GoalApproval(goal_id=goal.id, stage="manager", action="reject_edit", comment=comment.strip(), actor_emp_no=user.emp_no))
+                                db.add(goal)
+                                db.commit()
+                                emp_t = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
+                                if emp_t and emp_t.email:
+                                    subject = f"【目標管理】目標の修正申請が却下されました（{year}年度）"
+                                    body = f"こんにちは、\n\n申請いただいた{year}年度の目標の修正が却下されました。\n\n却下理由: {comment.strip()}\n\n---\n本メールは自動送信されています。"
+                                    send_email(emp_t.email, subject, body)
+                                st.success("修正を却下しました。")
+                                st.rerun()
+                            else:
+                                st.error("却下理由を入力してください。")
+
+
+def page_goal_approve_edit_request() -> None:
+    user = require_role("評価者")
+    st.subheader("修正承認申請一覧（上長）")
+    year = get_selected_year()
+
+    with SessionLocal() as db:
+        subs = db.execute(select(Employee).where(Employee.manager_emp_no == user.emp_no, Employee.active.is_(True))).scalars().all()
+        if not subs:
+            st.info("部下がいません。")
+            return
+
+        sub_emp_nos = [e.emp_no for e in subs]
+
+        candidates = db.execute(
+            select(Goal)
+            .where(Goal.year == year, Goal.employee_emp_no.in_(sub_emp_nos), Goal.status == "hr_edit_requested")
+            .order_by(Goal.updated_at.desc())
+        ).scalars().all()
+        if not candidates:
+            st.info("修正承認申請がありません。")
+            return
+
+        st.markdown("### 修正承認待ち申請一覧")
+        
+        # 申請一覧をテーブル形式で表示
+        for goal in candidates:
+            emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
+            label = f"{goal.employee_emp_no} {emp_target.name if emp_target else ''} | 申請 {goal.updated_at:%Y-%m-%d}"
+            
             with st.expander(label, expanded=False):
                 items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id).order_by(GoalItem.id.asc())).scalars().all()
                 st.markdown("#### 目標内容")
@@ -2118,43 +2453,86 @@ def page_goal_approve_hr() -> None:
                         st.write(f"**実行計画(任意)**: {it.achievable}")
                         st.write(f"**完了時期(任意)**: {_fmt_date(it.deadline_date)}")
 
-                selected = st.checkbox("一括処理対象", key=f"gh_selected:{goal.id}")
-                if not selected:
-                    continue
-                action = st.selectbox(
-                    "処理",
-                    ["公開（承認）", "差し戻し（社員へ）"],
-                    key=f"gh_action:{goal.id}",
-                )
-                comment = st.text_area("コメント", value="", key=f"gh_comment:{goal.id}", height=120)
-                selected_goals.append((goal, action, comment))
+                st.markdown("#### 申請履歴")
+                approvals = db.execute(
+                    select(GoalApproval)
+                    .where(GoalApproval.goal_id == goal.id)
+                    .order_by(GoalApproval.created_at.desc())
+                ).scalars().all()
+                for approval in approvals:
+                    actor = db.execute(select(Employee).where(Employee.emp_no == approval.actor_emp_no)).scalar_one_or_none()
+                    actor_name = actor.name if actor else approval.actor_emp_no
+                    st.write(f"- {approval.created_at:%Y-%m-%d %H:%M} | {actor_name} | {approval.action} | {approval.comment}")
 
-        if not selected_goals:
-            st.info("処理する目標を選択してください。")
-            return
+                st.markdown("#### 処理選択")
+                col_approve, col_reject = st.columns(2)
+                with col_approve:
+                    if st.button("✅ 修正を許可（編集解放）", key=f"ge_approve:{goal.id}", use_container_width=True):
+                        goal.status = "manager_returned"
+                        db.add(
+                            GoalApproval(
+                                goal_id=goal.id,
+                                stage="manager",
+                                action="approve_edit",
+                                comment="修正を許可しました",
+                                actor_emp_no=user.emp_no,
+                            )
+                        )
+                        db.add(goal)
+                        db.commit()
+                        
+                        emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
+                        if emp_target and emp_target.email:
+                            subject = f"【目標管理】目標の修正が承認されました（{year}年度）"
+                            body = (
+                                "こんにちは、\n\n"
+                                f"申請いただいた{year}年度の目標の修正が承認されました。\n"
+                                "編集画面で修正を進めてください。\n\n---\n本メールは自動送信されています。"
+                            )
+                            send_email(emp_target.email, subject, body)
+                        
+                        st.success("修正を許可しました。")
+                        st.rerun()
+                
+                with col_reject:
+                    if st.button("❌ 修正を却下（ロック継続）", key=f"ge_reject:{goal.id}", use_container_width=True):
+                        st.session_state[f"ge_comment_mode:{goal.id}"] = True
+                
+                if st.session_state.get(f"ge_comment_mode:{goal.id}", False):
+                    comment = st.text_area("却下理由（必須）", value="", key=f"ge_comment:{goal.id}", height=120)
+                    if st.button("却下確定", key=f"ge_confirm_reject:{goal.id}", use_container_width=True):
+                        if comment.strip():
+                            goal.status = "hr_approved"
+                            db.add(
+                                GoalApproval(
+                                    goal_id=goal.id,
+                                    stage="manager",
+                                    action="reject_edit",
+                                    comment=comment.strip(),
+                                    actor_emp_no=user.emp_no,
+                                )
+                            )
+                            db.add(goal)
+                            db.commit()
+                            
+                            emp_target = db.execute(select(Employee).where(Employee.emp_no == goal.employee_emp_no)).scalar_one_or_none()
+                            if emp_target and emp_target.email:
+                                subject = f"【目標管理】目標の修正申請が却下されました（{year}年度）"
+                                body = (
+                                    "こんにちは、\n\n"
+                                    f"申請いただいた{year}年度の目標の修正が却下されました。\n\n"
+                                    f"却下理由: {comment.strip()}\n\n"
+                                    "---\n本メールは自動送信されています。"
+                                )
+                                send_email(emp_target.email, subject, body)
+                            
+                            st.success("修正を却下しました。")
+                            st.session_state[f"ge_comment_mode:{goal.id}"] = False
+                            st.rerun()
+                        else:
+                            st.error("却下理由を入力してください。")
 
-        if st.button("選択した目標を一括処理", use_container_width=True):
-            for goal, action, comment in selected_goals:
-                if action == "差し戻し（社員へ）" and not comment.strip():
-                    st.error("差し戻し時はコメントが必須です。")
-                    st.stop()
 
-            for goal, action, comment in selected_goals:
-                if action == "公開（承認）":
-                    goal.status = "hr_approved"
-                    db.add(GoalApproval(goal_id=goal.id, stage="hr", action="approve", comment=comment.strip(), actor_emp_no=user.emp_no))
-                else:
-                    goal.status = "hr_returned"
-                    db.add(GoalApproval(goal_id=goal.id, stage="hr", action="return", comment=comment.strip(), actor_emp_no=user.emp_no))
-                db.add(goal)
-
-            db.commit()
-            st.success("選択した目標を処理しました。")
-            st.rerun()
-
-# =============================================================================
-# Evaluation: pages (Self / Manager / HR)
-# =============================================================================
 def page_eval_input_self() -> None:
     user = require_role("入力者")
     section_title("自己評価", "⭐")
@@ -2507,59 +2885,82 @@ def page_eval_approve_hr() -> None:
             items = db.execute(select(GoalItem).where(GoalItem.goal_id == goal.id)).scalars().all()
             biz = [it for it in items if it.type == "business"]
             pct, what_auto = calc_what_from_business(biz)
-            with st.expander(f"{evaluation.employee_emp_no} {emp_target.name if emp_target else ''} | 更新 {evaluation.updated_at:%Y-%m-%d}", expanded=False):
-                st.write(f"what: self={evaluation.what_self} / manager={evaluation.what_manager} / auto={what_auto}（平均 {pct:.1f}%）")
-                st.write(f"how: self={evaluation.how_self} / manager={evaluation.how_manager}")
-                st.write(f"自己コメント: {evaluation.self_comment}")
-                st.write(f"上長コメント: {evaluation.manager_comment}")
+            
+            # チェックボックスを左側に配置
+            col_check, col_expand = st.columns([0.08, 0.92])
+            with col_check:
+                selected = st.checkbox("", key=f"eh_selected:{evaluation.id}", label_visibility="collapsed")
+            
+            with col_expand:
+                with st.expander(f"{evaluation.employee_emp_no} {emp_target.name if emp_target else ''} | 更新 {evaluation.updated_at:%Y-%m-%d}", expanded=selected):
+                    st.write(f"what: self={evaluation.what_self} / manager={evaluation.what_manager} / auto={what_auto}（平均 {pct:.1f}%）")
+                    st.write(f"how: self={evaluation.how_self} / manager={evaluation.how_manager}")
+                    st.write(f"自己コメント: {evaluation.self_comment}")
+                    st.write(f"上長コメント: {evaluation.manager_comment}")
 
-                selected = st.checkbox("一括処理対象", key=f"eh_selected:{evaluation.id}")
-                if not selected:
-                    continue
-
-                what_default = evaluation.what_manager or what_auto
-                how_default = evaluation.how_manager or (evaluation.how_self or "does_not_meet")
-                what_final = st.selectbox(
-                    "what（最終）",
-                    rating_options,
-                    index=rating_options.index(what_default if what_default in rating_options else "meets"),
-                    format_func=lambda x: rating_labels[x],
-                    key=f"eh_what:{evaluation.id}",
-                )
-                how_final = st.selectbox(
-                    "how（最終）",
-                    rating_options,
-                    index=rating_options.index(how_default if how_default in rating_options else "meets"),
-                    format_func=lambda x: rating_labels[x],
-                    key=f"eh_how:{evaluation.id}",
-                )
-                action = st.selectbox(
-                    "処理",
-                    ["HR確認（確定/公開）", "差し戻し（上長へ）"],
-                    key=f"eh_action:{evaluation.id}",
-                )
-                comment = st.text_area(
-                    "HRコメント（差し戻し時は必須）",
-                    value=evaluation.hr_comment or "",
-                    key=f"eh_comment:{evaluation.id}",
-                    height=120,
-                )
-                selected_evals.append((evaluation, what_final, how_final, action, comment))
+                    if selected:
+                        st.markdown("#### 最終評価")
+                        what_default = evaluation.what_manager or what_auto
+                        how_default = evaluation.how_manager or (evaluation.how_self or "does_not_meet")
+                        what_final = st.selectbox(
+                            "what（最終）",
+                            rating_options,
+                            index=rating_options.index(what_default if what_default in rating_options else "meets"),
+                            format_func=lambda x: rating_labels[x],
+                            key=f"eh_what:{evaluation.id}",
+                        )
+                        how_final = st.selectbox(
+                            "how（最終）",
+                            rating_options,
+                            index=rating_options.index(how_default if how_default in rating_options else "meets"),
+                            format_func=lambda x: rating_labels[x],
+                            key=f"eh_how:{evaluation.id}",
+                        )
+                        
+                        st.markdown("#### 処理選択")
+                        col_approve, col_reject = st.columns(2)
+                        with col_approve:
+                            if st.button("✅ HR確認（確定/公開）", key=f"eh_approve:{evaluation.id}", use_container_width=True):
+                                selected_evals.append((evaluation, what_final, how_final, "HR確認（確定/公開）", ""))
+                        with col_reject:
+                            if st.button("❌ 差し戻し（上長へ）", key=f"eh_reject:{evaluation.id}", use_container_width=True):
+                                st.session_state[f"eh_comment_mode:{evaluation.id}"] = True
+                        
+                        if st.session_state.get(f"eh_comment_mode:{evaluation.id}", False):
+                            comment = st.text_area(
+                                "差し戻し理由（必須）",
+                                value=evaluation.hr_comment or "",
+                                key=f"eh_comment:{evaluation.id}",
+                                height=120,
+                            )
+                            if st.button("差し戻し確定", key=f"eh_confirm_reject:{evaluation.id}", use_container_width=True):
+                                if comment.strip():
+                                    selected_evals.append((evaluation, what_final, how_final, "差し戻し（上長へ）", comment))
+                                    st.session_state[f"eh_comment_mode:{evaluation.id}"] = False
+                                    st.rerun()
+                                else:
+                                    st.error("差し戻し理由を入力してください。")
 
         if not selected_evals:
-            st.info("処理する評価を選択してください。")
+            st.warning("処理する項目を選択してください。")
+            st.info("各評価の詳細を開き、「HR確認（確定/公開）」または「差し戻し」ボタンをクリックしてください。")
             return
 
-        if st.button("選択した評価を一括処理", use_container_width=True):
-            for evaluation, _, _, action, comment in selected_evals:
-                if action == "差し戻し（上長へ）" and not comment.strip():
-                    st.error("差し戻し時はコメントが必須です。")
-                    st.stop()
+        st.markdown("### 処理内容確認")
+        st.write(f"**処理対象数**: {len(selected_evals)}件")
+        
+        col_approve, col_reject = st.columns(2)
+        with col_approve:
+            if st.button("✅ 一括確定", use_container_width=True):
+                for evaluation, _, _, action, comment in selected_evals:
+                    if action == "差し戻し（上長へ）" and not comment.strip():
+                        st.error("差し戻し時はコメントが必須です。")
+                        st.stop()
 
-            for evaluation, what_final, how_final, action, comment in selected_evals:
-                if action == "HR確認（確定/公開）":
-                    evaluation.status = "hr_approved"
-                    evaluation.what_final = what_final
+                for evaluation, what_final, how_final, action, comment in selected_evals:
+                    if action == "HR確認（確定/公開）":
+                        evaluation.status = "hr_approved"
+                        evaluation.what_final = what_final
                     evaluation.how_final = how_final
                     evaluation.hr_comment = comment.strip()
                     evt_action = "approve"
@@ -2901,7 +3302,9 @@ PAGES: Dict[str, Callable[[], None]] = {
     "approval_status_self": page_approval_status_self,
     # manager
     "goal_view_manager": page_goal_view_manager,
+    "approval_list_manager": page_approval_list_manager,
     "goal_approve_manager": page_goal_approve_manager,
+    "goal_approve_edit_request": page_goal_approve_edit_request,
     "eval_input_manager": page_eval_input_manager,
     "oneonone_manager": page_oneonone_manager,
     # admin/hr
